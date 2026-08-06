@@ -534,7 +534,7 @@ def main():
     bridge.token = args.token
     bridge.live = not args.no_live
     if nomad_target:
-        connection.connect(nomad_target[0], nomad_target[1], bridge.token, "1.0.0", PROTOCOL)
+        connection.connect(nomad_target[0], nomad_target[1], bridge.token, transport.VERSION, PROTOCOL)
     actions = RemoteActions(cb, "Nomad", ["Pull sculpt", "Send retopo"])
 
     print(f"auto-send (live) is {'on' if bridge.live else 'off'}")
@@ -558,7 +558,7 @@ def main():
                     if nomad_target:
                         bridge.pairing_logged = False
                         bridge.claimed = False  # the fresh session needs a new claim
-                        connection.connect(nomad_target[0], nomad_target[1], bridge.token, "1.0.0", PROTOCOL)
+                        connection.connect(nomad_target[0], nomad_target[1], bridge.token, transport.VERSION, PROTOCOL)
             elif not announced and connection.status == "Connected":
                 announced = True  # the hello handler prints the reconnection
             for header, binary in connection.poll():

@@ -639,7 +639,7 @@ def main():
     bridge = Bridge(connection, goz, args.scale, zbrush)
     bridge.token = args.token
     if target:
-        connection.connect(target[0], target[1], bridge.token, "1.0.0", PROTOCOL)
+        connection.connect(target[0], target[1], bridge.token, transport.VERSION, PROTOCOL)
     if root.is_dir():
         goz.register()
 
@@ -664,7 +664,7 @@ def main():
                             target = found
                     if target:
                         bridge.pairing_logged = False
-                        connection.connect(target[0], target[1], bridge.token, "1.0.0", PROTOCOL)
+                        connection.connect(target[0], target[1], bridge.token, transport.VERSION, PROTOCOL)
             elif not announced and connection.status == "Connected":
                 announced = True  # the hello handler prints the reconnection
             for header, binary in connection.poll():

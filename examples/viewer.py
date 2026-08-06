@@ -53,7 +53,7 @@ def main():
         print(f"found Nomad at {host}:{port}")
 
     connection = transport.Connection(client_name="Viewer Example", capabilities=CAPABILITIES)
-    connection.connect(host, port, token, "1.0.0", 1)
+    connection.connect(host, port, token, transport.VERSION, 1)
     cameras = 0
     try:
         while True:

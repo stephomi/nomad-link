@@ -4,7 +4,7 @@ Nomad Sculpt exposes a socket protocol for live two-way scene synchronization wi
 external applications.
 - The Blender extension (`blender/nomad_blender_link`, GPL-3.0) is
 the complete reference client;
-- The Python bridges next to this file (`viewer.py`,
+- The Python bridges in `examples/` (`viewer.py`,
 `zbrush.py`, `cozyblanket.py`, MIT) are standalone examples.
 
 This document specifies the
