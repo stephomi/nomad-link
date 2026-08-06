@@ -7,7 +7,7 @@
       "id": "nomad_blender_link",
       "name": "Nomad Blender Link",
       "tagline": "Exchange meshes, cameras, and sculpt edits with Nomad Sculpt",
-      "version": "0.11.33",
+      "version": "0.11.34",
       "type": "add-on",
       "maintainer": "Hexanomad",
       "license": [
@@ -17,9 +17,9 @@
       "permissions": {
         "network": "Discover and connect to Nomad Sculpt on the local network"
       },
-      "archive_url": "./nomad_blender_link-0.11.33.zip",
-      "archive_size": 46036,
-      "archive_hash": "sha256:b91421bd807c2214faad2481d4180726ba6e9accf2e098e7c113c0bec9b145bc"
+      "archive_url": "./nomad_blender_link-0.11.34.zip",
+      "archive_size": 46195,
+      "archive_hash": "sha256:fc16dfd410da695f4d8b083fa090f97727abc1cba80c8d9f3e37be5883bed3e0"
     }
   ]
 }

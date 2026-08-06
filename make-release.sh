@@ -1,19 +1,26 @@
 #!/bin/sh
-# Bump the version in README.md, run this. Everything else follows from it.
+# Maintainer only: publishes the release. Bump the version in README.md, run this.
 set -e
 cd "$(dirname "$0")"
 
+[ -f ../../src/link/LinkProtocol.hpp ] || {
+    echo "Nothing to do here — this publishes the release, it is not needed to use the bridges."
+    exit 0
+}
+
 BLENDER=${BLENDER:-/Applications/Blender.app/Contents/MacOS/Blender}
+command -v gh >/dev/null || { echo "gh is missing: brew install gh && gh auth login" >&2; exit 1; }
+[ -x "$BLENDER" ] || { echo "no Blender at $BLENDER, set BLENDER=" >&2; exit 1; }
+
 ver=$(sed -n 's/^Version \*\*\([^*]*\)\*\*.*/\1/p' README.md)
 [ -n "$ver" ] || { echo "no version in README.md" >&2; exit 1; }
-ls blender/repository/nomad_blender_link-$ver.zip >/dev/null 2>&1 &&
-    { echo "$ver is already published, bump README.md" >&2; exit 1; }
+gh release view "$ver" >/dev/null 2>&1 &&
+    { echo "$ver is already released, bump README.md" >&2; exit 1; }
 
 # propagate the version
 sed -i '' "s/^VERSION = \"[^\"]*\"/VERSION = \"$ver\"/" examples/transport.py
 sed -i '' "s/^version = \"[^\"]*\"/version = \"$ver\"/" blender/nomad_blender_link/blender_manifest.toml
-[ -f ../../src/link/LinkProtocol.hpp ] &&
-    sed -i '' "s/BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$ver\"/g" ../../src/link/LinkProtocol.hpp
+sed -i '' "s/BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$ver\"/g" ../../src/link/LinkProtocol.hpp
 
 # bridges archive (stable name, /releases/latest/download/ depends on it)
 rm -f nomad-link-bridges.zip
