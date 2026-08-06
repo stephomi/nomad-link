@@ -1,25 +1,17 @@
 # Nomad Link Protocol
 
-Nomad Sculpt exposes a socket protocol for live two-way scene synchronization with
-external applications.
-- The Blender extension (`blender/nomad_blender_link`, GPL-3.0) is
-the complete reference client;
-- The Python bridges in `examples/` (`viewer.py`,
-`zbrush.py`, `cozyblanket.py`, MIT) are standalone examples.
+Socket protocol for two-way scene synchronization with Nomad Sculpt.
 
-This document specifies the
-wire protocol so bridges for other applications (Maya, Houdini, game engines, custom
-tools) can be written in any language.
-
-Nomad is always the **server**; the bridge is always the **client**. Up to 8 clients may
-connect at once; exactly one of them is the *editor* that sends live edits (§5).
-
+- Nomad is the server. Bridges are clients.
+- Up to 8 clients can connect. One client sends live edits (§5).
+- `blender/nomad_blender_link` is the reference client (GPL-3.0).
+- `examples/` contains standalone Python bridges (MIT).
 - Protocol version: **1** (integer; changes only on breaking framing/handshake changes)
 - Default TCP port: **48312**
 
 ## 1. Transport and framing
 
-Plain TCP. Every packet in both directions is one frame:
+TCP. Each packet is one frame:
 
 | bytes | content |
 |---|---|
@@ -28,32 +20,36 @@ Plain TCP. Every packet in both directions is one frame:
 | n | JSON object, UTF-8 |
 | m | binary payload (may be empty) |
 
-Limits: JSON ≤ 1 MiB, binary ≤ 1 GiB. Oversized frames should cause a disconnect.
-Every JSON payload is an object with a `"type"` string; unknown types and unknown
-fields must be ignored (forward compatibility). All binary offsets in headers are byte
-offsets into the frame's binary payload; headers carrying binary also carry
-`"binary_size"` which must equal the payload size.
+Limits: JSON ≤ 1 MiB; binary ≤ 1 GiB. Disconnect on larger frames.
 
-**WebSocket variant**: Nomad running in a browser cannot open raw TCP, so it dials a
-WebSocket (`ws://host:port/`) instead; each *binary WebSocket message* carries exactly
-one frame in the layout above. Everything else — handshake, roles, messages — is
-identical. The browser adopts its role from the first hello it receives: a Nomad host
-acks its join hello (`nomad_version` present) and the browser stays a joined client; a
-client listener (the Blender extension's "Listen for Nomad Web") sends its own client
-hello and the browser takes the host role. Nomad hosts accept the HTTP upgrade on the
-same TCP port they listen on, so a browser can join them directly.
+JSON payloads are objects with a `"type"` string. Ignore unknown types and fields.
+Offsets are byte offsets into the binary payload. When binary data is present,
+`"binary_size"` must match its size.
+
+### WebSocket
+
+Browser builds use `ws://host:port/`. Each binary WebSocket message contains one frame
+in the format above. The rest of the protocol is unchanged.
+
+The first `hello` sets the browser's role:
+
+- A Nomad host replies to the browser's join `hello` (`nomad_version` is present). The
+  browser remains a client.
+- A client listener sends its own `hello`. The browser becomes the host.
+
+Nomad accepts TCP and WebSocket connections on the same port.
 
 ## 2. Discovery (optional)
 
-Two mechanisms; a bridge may implement either or both, or let the user type the address.
+A bridge can use either method or accept an address from the user.
 
 - **UDP broadcast**: send the ASCII datagram `NOMAD_LINK_DISCOVER 1` to
   `255.255.255.255:<port>`. Nomad replies to the sender with JSON:
   `{"type": "nomad_link", "name": "Nomad Sculpt", "protocol": 1, "port": 48312}`.
   Use the reply's source IP as the host.
 - **Bonjour/mDNS**: Nomad advertises `_nomadlink._tcp` on Apple platforms. The SRV
-  record carries the port; use the responder's IP as the host. (Preferred for iPad,
-  where receiving raw broadcasts is restricted by the OS.)
+  record contains the port; use the responder's IP. Prefer this on iPad, where the OS
+  restricts UDP broadcast reception.
 
 ## 3. Conventions
 
@@ -61,17 +57,16 @@ Two mechanisms; a bridge may implement either or both, or let the user type the 
   `"coordinate_system": "nomad_y_up"` where relevant. Units are arbitrary scene units.
 - **Matrices**: 16 floats, **column-major** (`world_matrix[column*4 + row]`).
 - **Mesh transforms**: vertex positions are in node-local space; `world_matrix` places
-  the node. When a transform contains skew that a target application cannot represent,
-  Nomad also sends `world_matrix_parent` and `local_matrix` (world = parent × local,
-  both skew-free); a bridge may reproduce the split with a helper parent or ignore it
-  and use `world_matrix`.
+  the node. For skewed transforms, Nomad may also send `world_matrix_parent` and
+  `local_matrix` (world = parent × local; both are skew-free). Use the split if needed,
+  otherwise use `world_matrix`.
 - **Lights and cameras** aim along their local **-Z** axis with +Y up (glTF convention).
-  Their `world_matrix` is a world frame — no vertex data exists to re-express, so map it
-  directly between coordinate systems (do not conjugate like a mesh transform).
+  Convert their `world_matrix` directly between coordinate systems. Do not convert it
+  like a mesh transform.
 - **Faces**: triangles and quads only, as `int32x4`; a triangle sets the 4th index to -1.
 - **Ids**: `mesh_id` / `link_id` / `geometry_id` are opaque strings chosen by whichever
-  side first names the entity (UUIDs recommended). They are stable for the life of the
-  link and should be persisted by both sides.
+  side names the entity first. UUIDs are recommended. Keep them for the life of the
+  link.
 
 ## 4. Handshake and pairing
 
@@ -88,12 +83,11 @@ The client connects and immediately sends:
 }
 ```
 
-- Wrong `protocol` → `error` + disconnect.
-- Known `pair_token` → Nomad replies `hello` at once.
-- Unknown/empty token → Nomad replies `{"type": "pairing_pending"}` and waits for the
-  user to accept the connection in Nomad's UI. Show "waiting for approval" and keep the
-  connection open. On acceptance the `hello` reply arrives; on refusal, `error` +
-  disconnect.
+- Wrong `protocol`: `error`, then disconnect.
+- Known `pair_token`: Nomad replies with `hello`.
+- Unknown or empty token: Nomad replies with `{"type": "pairing_pending"}`. Keep the
+  connection open while the user accepts it in Nomad. Nomad then sends `hello`, or
+  `error` and disconnects if refused.
 
 Nomad's `hello` reply:
 
@@ -110,22 +104,19 @@ Nomad's `hello` reply:
 ```
 
 Store `pair_token` persistently and send it in future hellos for silent reconnects.
-`bridge_version`/`minimum_bridge_version` implement the reference client's self-update
-against its extension repository; third-party bridges may ignore them (compare your own
-versioning independently). `{"type": "ping"}` → `{"type": "pong"}` is available as a
-keepalive. `{"type": "error", "message": "...", "request_id": "..."}` may arrive at any
-time; treat it as "resynchronize anything you were assuming" (see §9).
+The version fields are used by the reference client's updater; other bridges may ignore
+them. Use `{"type": "ping"}` / `{"type": "pong"}` as a keepalive. An `error` can arrive
+at any time; see §9.
 
 ### Capabilities
 
-Sent by both sides; act only on what the peer advertises — it may be an older Nomad or
-a partial bridge, and unadvertised messages vanish silently (§1). Current values:
+Both sides send capabilities. Use only capabilities advertised by the peer.
 
 | capability | meaning when advertised |
 |---|---|
 | `selection_transfer` / `scene_transfer` | peer answers `request_selection` / `request_scene` |
 | `scene_edits`, `object_state`, `material`, `light`, `camera_object` | peer understands those live messages |
-| `session_config` | peer participates in shared config (§5) |
+| `session_config` | peer supports shared config (§5) |
 | `mesh_full`, `mesh_delta`, `mesh_attributes`, `sculpt_layers` | Nomad → bridge data kinds |
 | `camera` | advertiser sends working-view messages (§10); Nomad shows its view-sync toggle only while a peer advertises this |
 | `mesh_delta_receive` | advertiser accepts incoming sparse `mesh_delta`; without it send `mesh_full` |
@@ -134,14 +125,14 @@ a partial bridge, and unadvertised messages vanish silently (§1). Current value
 | `display_config` | peer applies display settings (§10.1); Nomad only sends them to peers advertising this |
 | `texture` | peer caches texture blobs by immutable id (§10.2); Nomad only sends blobs to peers advertising this |
 
-A minimal one-way bridge (e.g. a game-engine viewer) can implement only `hello`,
-`mesh_full` receive, and `object_state` receive.
+A minimal viewer needs only `hello`, `mesh_full`, and `object_state`.
 
-## 5. Session configuration and source arbitration
+## 5. Session configuration
 
-Live sync settings are shared state owned by Nomad, replicated by revision number:
+Nomad owns the live-sync settings and sends revisions to clients.
 
 - Nomad → client, sent after hello and whenever anything changes:
+
 ```jsonc
 {
     "type": "session_config",
@@ -160,43 +151,40 @@ Live sync settings are shared state owned by Nomad, replicated by revision numbe
     "source_name": "Nomad iPad"  // device currently sending live edits (may be you)
 }
 ```
+
 - Client → Nomad: `{"type": "set_session_config", "base_revision": n, ...same flags}`.
-  If `base_revision` is stale Nomad answers with the current config instead of applying.
-- `{"type": "claim_sync", "source": "client"}` — in `auto` mode, the client claims
-  authorship when its user shows meaningful activity; Nomad claims it back on its own
-  user activity. Only the current `active_source` sends live edits; the other side
-  applies them. Do not claim while you hold stale data (§9).
-- With several clients connected, one client at a time is the *editor*; the others are
-  viewers fed by Nomad's relay and see `active_source: "nomad"`. A `claim_sync` from a
-  live-sync-capable viewer promotes it to editor (the previous editor becomes a viewer),
-  so the last client with user activity is the one that sends. `set_session_config` is
-  accepted from any client — the session config is shared, changing it does not change
-  the editor.
-- Nomad itself can join another Nomad's session (Link menu → nearby devices): the
-  joining side speaks this exact client protocol — `hello` with a pair token,
-  `claim_sync` on activity, the host's `session_config` as the authority — while
-  swapping the wire's `nomad`/`client` labels to its own perspective.
+  If the revision is stale, Nomad returns the current config without applying the
+  change.
+- In `auto` mode, a client sends `{"type": "claim_sync", "source": "client"}` after
+  user activity. User activity in Nomad sets the source back to Nomad. Only
+  `active_source` sends live edits. Do not claim while local objects are stale (§9).
+- With multiple clients, one is the editor and the rest receive Nomad's relay. A
+  `claim_sync` promotes that client to editor. Any client can change session settings;
+  doing so does not make it the editor.
+- A Nomad instance can join another Nomad as a client. It uses the same messages and
+  treats the host's `session_config` as current, with `nomad` and `client` interpreted
+  from its side of the connection.
 
 ("client" always means the connected bridge, whatever the application is.)
 
 ## 6. Live flag and channels
 
-Messages that mirror ongoing edits carry `"live_sync": true` and must be **dropped by
-the receiver** unless live sync is enabled, the sender is the current `active_source`,
-and the matching channel flag (`sync_objects`, `sync_materials`, …) is on. Messages
-from explicit user transfers (Send/Get buttons) carry `"live_sync": false` and are
-always applied. Requests carry a `request_id` echoed by acks and errors.
+Apply `"live_sync": true` messages only when live sync is enabled, the sender is
+`active_source`, and the matching channel is enabled. Otherwise drop them.
+
+Always apply explicit transfers (`"live_sync": false`). Echo request `request_id`
+values in acks and errors.
 
 ## 7. Mesh transfer
 
 ### 7.1 `mesh_full`
 
-Complete mesh state in one frame. 
-- `*_offset` = byte offset into the binary payload
-(§1), paired with a `*_format`.
-- ⭐ = always present, the rest is optional. Offsets
-below: a cube (8 vertices, 6 quads, 14 UVs, one layer) packed back-to-back — no
-alignment required.
+Complete mesh state in one frame.
+
+- `*_offset` is a byte offset into the binary payload and has a matching `*_format`.
+- ⭐ fields are required. Other fields are optional.
+- The example is a cube with 8 vertices, 6 quads, 14 UVs, and one layer. Data is
+  packed without alignment.
 
 ```jsonc
 {
@@ -292,13 +280,13 @@ alignment required.
 }
 ```
 
-Reply: `{"type": "mesh_ack", "mesh_id": ..., "request_id": ...}` — adopt the acked
-`mesh_id` as the link id for the object you sent.
+Reply with `{"type": "mesh_ack", "mesh_id": ..., "request_id": ...}`. The sender uses
+the returned `mesh_id` as the object's link id.
 
 ### 7.2 `mesh_delta` — sparse updates (both directions)
 
-After a sculpt/paint stroke, only touched vertices travel. One delta per completed
-stroke; each is one undoable step on the receiver.
+Send one delta per completed sculpt or paint stroke. It contains only touched vertices
+and becomes one undo step on the receiver.
 
 ```jsonc
 {
@@ -328,18 +316,17 @@ stroke; each is one undoable step on the receiver.
 }
 ```
 
-Deltas require identical topology on both ends — never send one unless your last known
-full state matches; on any doubt send `mesh_full`. Nomad rejects deltas for procedural
-primitives (`error` → §9). Meshes with sculpt layers accept them: base strokes carry
-`base_*` sections, layer strokes carry `layer_index` + `layer_*` sections, and clients
-that only track the composite read the plain paint sections either way.
+Send deltas only when both sides have identical topology. Otherwise send `mesh_full`.
+Nomad rejects deltas for procedural primitives (`error`; §9).
+
+For meshes with sculpt layers, base strokes use `base_*`; layer strokes use
+`layer_index` and `layer_*`. Clients without layer support use the plain composite
+paint sections.
 
 ### 7.3 `mesh_attributes`
 
-Full-array refresh of paint channels and layer settings without topology. Used by
-Nomad for layer-factor changes and paint undo; accepted (as one undoable step) when
-the peer advertises `mesh_attributes_receive`, `layers` configs matched to user
-layers by index.
+Refreshes paint arrays and layer settings without topology. It is one undoable step.
+The receiver must advertise `mesh_attributes_receive`. Match `layers` by index.
 
 ```jsonc
 {
@@ -362,15 +349,13 @@ layers by index.
 }
 ```
 
-The paint arrays are the sender's composite. A receiver whose linked mesh has sculpt
-layers applies the `layers` configs only and recomposites locally; the arrays are for
-clients that track the composite (bridges).
+Paint arrays contain the sender's composite. A receiver with sculpt layers applies
+only the `layers` settings and recomposites locally.
 
 ## 8. Instances (`mesh_instance`)
 
-Shared geometry is all-or-nothing on both ends (Nomad instances / e.g. Blender objects
-sharing one mesh datablock). Every `mesh_full` names its geometry group via
-`geometry_id`. Additional nodes of an already-transferred group travel as:
+Each `mesh_full` identifies its shared geometry with `geometry_id`. After the geometry
+has been sent, send its other instances as:
 
 ```json
 {
@@ -385,34 +370,33 @@ sharing one mesh datablock). Every `mesh_full` names its geometry group via
 }
 ```
 
-Receiver: create a node/object sharing the geometry of the group; if the `mesh_id`
-already exists but references other geometry, re-point it. If `geometry_id` is unknown,
-answer `error` **and** `{"type": "request_mesh", "link_id": <mesh_id>}` — the peer then
-sends that node as a forced `mesh_full`. A `mesh_full` arriving for a node whose group
-gains a *different* `geometry_id` means the peer un-shared it (single-user); detach that
-node from its group. A `mesh_full` with the *same* `geometry_id` but new topology
-replaces the geometry for the entire group. Edits applied to shared geometry reach all
-nodes of the group implicitly — never send per-sibling copies of the same delta.
+The receiver creates an object that shares the group's geometry. If its `mesh_id`
+already uses other geometry, reassign it.
 
-## 9. Recovery discipline
+If `geometry_id` is unknown, send `error` and
+`{"type": "request_mesh", "link_id": <mesh_id>}`. The peer must reply with
+`mesh_full`, not `mesh_instance`.
 
-The protocol favors "resend fully" over clever reconciliation. A bridge must:
+If an existing node receives a different `geometry_id` in `mesh_full`, detach it from
+its old group. If it receives new topology with the same `geometry_id`, replace the
+geometry for the whole group. Send one delta per shared geometry, not per instance.
 
-- On any `error` from the peer: drop delta caches / instance-known state; the next
-  geometry send is a `mesh_full`.
-- On `{"type": "request_mesh", "link_id": ...}`: send that object as a forced
-  `mesh_full` (never `mesh_instance`). Without `link_id`, `request_mesh` /
-  `request_selection` mean "send your current selection"; `request_scene` all objects.
-- If an incoming live edit cannot be applied right now (target busy/uneditable), mark
-  the object stale, refuse to *send* geometry for it, and ask for a fresh `mesh_full`
-  (targeted `request_mesh`) once it becomes writable. Never claim `auto` authorship
-  while holding stale objects.
-- `mesh_invalidated` and `request_active_mesh` are legacy message types; handle them as
-  "refresh the link with a Get" and "send selection" respectively if received.
+## 9. Recovery
+
+- After any `error`, clear delta and known-instance caches. Send `mesh_full` next.
+- For `{"type": "request_mesh", "link_id": ...}`, send that object as `mesh_full`,
+  never `mesh_instance`.
+- Without `link_id`, `request_mesh` and `request_selection` request the current
+  selection. `request_scene` requests all objects.
+- If a live edit cannot be applied, mark the object stale and do not send its geometry.
+  When it becomes writable, request a targeted `mesh_full`. Do not claim sync while any
+  local object is stale.
+- Legacy `mesh_invalidated` requests a refresh. Legacy `request_active_mesh` requests
+  the current selection.
 
 ## 10. Scene objects
 
-Values shown are defaults; map what you can and ignore the rest.
+Values shown are defaults. Map supported fields and ignore the rest.
 
 `object_state` — rename/move/hide without geometry:
 
@@ -515,14 +499,12 @@ Values shown are defaults; map what you can and ignore the rest.
 }
 ```
 
-† auto-capable settings travel as a pair: `<name>_value` is the **resolved** state —
-apply it directly; `<name>_auto` records whether it was an explicit choice or Nomad's
-default. Senders set `<name>_value`; add `<name>_auto: true` only to hand the choice
-back to the receiver's default.
+† Auto settings use two fields. Apply `<name>_value`. `<name>_auto` records whether the
+value comes from the receiver's default. Send `<name>_auto: true` only to restore that
+default.
 
-Send only the fields your application edits: absent fields keep their current values.
-The matcap channel is not part of the protocol. (`mesh_full` also carries a top-level
-`smooth_shading` for receivers that skip the material block.)
+Send only edited fields. Absent fields are unchanged. The matcap channel is not
+supported. `mesh_full` also has top-level `smooth_shading`.
 
 `light`:
 
@@ -550,8 +532,8 @@ The matcap channel is not part of the protocol. (`mesh_full` also carries a top-
 }
 ```
 
-As with `material`, send only what your application edits; Nomad-specific fields like
-`attachment` or the shadow tuning may be ignored by other applications.
+Send only edited fields. Other applications may ignore Nomad-specific settings such as
+`attachment` and shadow tuning.
 
 `camera_object`:
 
@@ -565,8 +547,8 @@ As with `material`, send only what your application edits; Nomad-specific fields
 }
 ```
 
-`camera` — the **working view** (not a scene object). Sent by the current source on
-navigation; apply to your viewport. Coalesce: only the newest matters.
+`camera` is the working view, not a scene object. Apply the newest message to the
+viewport and discard older pending messages.
 
 ```jsonc
 {
@@ -582,29 +564,24 @@ navigation; apply to your viewport. Coalesce: only the newest matters.
 
 ### 10.1 `display_config`
 
-Postprocess and shading state, exchanged only between peers that both advertise the
-`display_config` capability and gated by the `sync_display` channel:
+Postprocess and shading settings. Both peers must advertise `display_config`. Live
+messages also require the `sync_display` channel.
 
 ```json
 {"type": "display_config", "live_sync": true, "display": { ... }}
 ```
 
-`display` carries Nomad's display settings with the same keys as its settings files:
-shading (`shader_type`, `matcap_*`, `env_*`, `show_*`, `background_blur`,
-`lights_enable`) and postprocess (`pp_*`). Sent by the current source on any change.
-Between two Nomads this reproduces the full display state; other applications map
-selectively (e.g. exposure, DOF) and ignore the rest.
+`display` uses the keys from Nomad settings files: shading (`shader_type`, `matcap_*`,
+`env_*`, `show_*`, `background_blur`, `lights_enable`) and postprocess (`pp_*`). Other
+applications may map only supported settings.
 
-A scene transfer (`request_scene` or an explicit send-all) also emits one
-`display_config` with `"live_sync": false` — the one-shot form is accepted regardless
-of the `sync_display` channel toggle, so a pulled scene arrives with its look.
+A scene transfer also sends one `display_config` with `"live_sync": false`. Apply it
+even when `sync_display` is off.
 
 ### 10.2 Textures (`texture`, `request_texture`)
 
-Texture pixels travel as blobs referenced from the material block (§10) by
-`texture_id`. **An id names exact pixel content, immutably**: cache blobs by id for the
-session and never re-request one you hold. Undo/redo of a bake on the sender only flips
-the material back to ids every peer already cached — no pixels travel twice.
+Material blocks reference texture blobs by `texture_id`. An id always refers to the
+same bytes. Cache blobs for the session and do not request an id already cached.
 
 ```jsonc
 {
@@ -616,33 +593,29 @@ the material back to ids every peer already cached — no pixels travel twice.
 }
 ```
 
-- **Sender**: emit the blob once, before the first message referencing its id; after
-  that reference freely. Skip the blob for peers not advertising `texture`.
-- **Receiver**: on a material referencing an unknown id, keep the channel's current
-  texture, send `{"type": "request_texture", "texture_id": "…"}` back to the sender,
-  and finish the assignment when the blob arrives. This is also how late joiners
-  catch up. On an unanswerable request the peer replies `error`.
-- Blobs are cache fills, not edits: no `live_sync` gate, duplicates are ignored, and
-  they are relayed to viewers like scene messages.
+- **Sender**: send the blob before its first reference. Do not send it again. Do not
+  send blobs to peers without the `texture` capability.
+- **Receiver**: for an unknown id, keep the current texture and send
+  `{"type": "request_texture", "texture_id": "…"}`. Assign it when the blob arrives.
+  Reply with `error` if an id cannot be provided.
+- Texture blobs are not live edits. They are not gated by `live_sync`; ignore
+  duplicates and relay them to viewers.
 - Treat `name` as untrusted display data (basename only), never as a path.
 
 ## 11. Versioning
 
-- `protocol` (int) — breaking changes only; mismatched peers must not talk.
-- Fields and message types are added backwards-compatibly; ignore unknowns, gate new
-  behavior behind `capabilities`.
-- The reference client's `bridge_version` / `minimum_bridge_version` handshake drives
-  its self-update; unrelated to third-party bridges.
+- `protocol` (int): breaking changes only. Disconnect on mismatch.
+- Ignore unknown fields and message types. Use capabilities for new behavior.
+- `bridge_version` and `minimum_bridge_version` are for the reference client's updater.
 
-## 12. Writing a new bridge: minimum checklists
+## 12. Minimum implementation
 
-**One-way viewer** (engine/renderer): framing, `hello` (+pairing wait), apply
+**Viewer**: framing, `hello` and pairing, apply
 `mesh_full`, `mesh_instance`, `object_state`, `object_delete`; optionally `mesh_delta`,
 `material`, `light`, `camera`. Advertise only what you handle.
 
-**Two-way editor**: additionally send `mesh_full` with your own `mesh_id`/`geometry_id`,
-handle `mesh_ack`, `request_*`, `session_config`/`claim_sync`, implement the §9
-recovery rules, and batch edits per completed user action (one undoable step each).
+**Editor**: also send `mesh_full` with your own `mesh_id` and `geometry_id`,
+handle `mesh_ack`, `request_*`, `session_config`/`claim_sync`, follow §9, and send one
+edit per completed user action.
 
-`blender/nomad_blender_link` demonstrates every part of this document, including the
-sparse-delta caching, instance bookkeeping, and stale/recovery handling.
+See `blender/nomad_blender_link` for a complete implementation.
