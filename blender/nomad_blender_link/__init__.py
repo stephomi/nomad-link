@@ -33,7 +33,7 @@ TO_NOMAD = Matrix.Rotation(math.radians(-90.0), 4, "X")
 TO_BLENDER = TO_NOMAD.inverted()
 
 # "texture" on top of the shared bridge defaults: only this client handles blobs
-connection = Connection(client_name="Blender", capabilities=DEFAULT_CAPABILITIES + ["texture"])
+connection = Connection(client_name="Blender", capabilities=DEFAULT_CAPABILITIES + ["texture", "ngon"])
 pending_objects = {}
 pending_transfers = []
 camera_pivot = None
@@ -69,6 +69,7 @@ VIEWPORT_SENSOR_WIDTH = 36.0
 VIEWPORT_ZOOM = 2.0
 SAFE_WRITE_MODES = {"OBJECT", "VERTEX_PAINT", "WEIGHT_PAINT", "TEXTURE_PAINT"}
 STALE_MESSAGE = "Live geometry paused; it refreshes automatically outside Edit Mode, Dyntopo, and Multires"
+MODIFIER_MESSAGE = "Objects sending their modifier results cannot receive; turn off Send Modifier Results"
 LAYER_DTYPE = numpy.dtype([("index", "<u4"), ("offset", "<f4", 3)])
 
 
@@ -224,6 +225,12 @@ def apply_object_transform(obj, header):
     generated_parent.matrix_world = parent
     obj.matrix_parent_inverse = Matrix.Identity(4)
     obj.matrix_basis = local
+
+
+def sends_evaluated(obj):
+    """True when Nomad gets the modifier results instead of obj.data. Those objects never receive:
+    the evaluated mesh cannot be written back, and obj.data would re-run the stack on top."""
+    return bool(getattr(obj, "modifiers", None)) and bpy.context.scene.nomad_link_send_modifiers
 
 
 def geometry_write_mode(obj):
@@ -825,18 +832,30 @@ def receive_mesh(header, binary):
         raise ValueError("Invalid mesh payload")
 
     positions = to_blender_vectors(read_array(binary, header["position_offset"], vertex_count * 3, "<f4").reshape(-1, 3))
-    faces = read_array(binary, header["face_offset"], face_count * 4, "<i4").reshape(-1, 4)
-    corner_mask = numpy.ones((face_count, 4), bool)
-    corner_mask[:, 3] = faces[:, 3] >= 0
-    corner_verts = faces[corner_mask]
+    corners = header.get("face_format") == "corners"
+    if corners:
+        loop_totals = read_array(binary, header["face_size_offset"], face_count, "<i4")
+        corner_count = int(header["corner_count"])
+        if loop_totals.size and (loop_totals.min() < 3 or loop_totals.sum() != corner_count):
+            raise ValueError("Invalid face payload")
+        corner_mask = None
+        corner_verts = read_array(binary, header["corner_vertex_offset"], corner_count, "<i4")
+    else:
+        faces = read_array(binary, header["face_offset"], face_count * 4, "<i4").reshape(-1, 4)
+        corner_mask = numpy.ones((face_count, 4), bool)
+        corner_mask[:, 3] = faces[:, 3] >= 0
+        corner_verts = faces[corner_mask]
+        loop_totals = corner_mask.sum(axis=1).astype(numpy.int32)
     if corner_verts.size and (corner_verts.min() < 0 or corner_verts.max() >= vertex_count):
         raise ValueError("Invalid face payload")
-    loop_totals = corner_mask.sum(axis=1).astype(numpy.int32)
     loop_starts = numpy.zeros(face_count, numpy.int32)
     numpy.cumsum(loop_totals[:-1], out=loop_starts[1:])
 
     mesh_id = header["mesh_id"]
     obj = find_linked_object(mesh_id)
+    if obj is not None and sends_evaluated(obj):
+        connection.error = MODIFIER_MESSAGE
+        return
     restore_mode = None
     if obj is not None and obj.mode != "OBJECT":
         restore_mode = enter_object_mode(obj)
@@ -870,8 +889,11 @@ def receive_mesh(header, binary):
             texcoords = read_array(binary, header["texcoord_offset"], texcoord_count * 2, "<f4").reshape(-1, 2)
             # Nomad's v origin is top-left (glTF style), Blender's bottom-left
             texcoords = numpy.column_stack((texcoords[:, 0], 1.0 - texcoords[:, 1]))
-            face_uv = read_array(binary, header["face_uv_offset"], face_count * 4, "<i4").reshape(-1, 4)
-            corner_uvs = face_uv[corner_mask]
+            if corners:
+                corner_uvs = read_array(binary, header["corner_texcoord_offset"], len(corner_verts), "<i4")
+            else:
+                face_uv = read_array(binary, header["face_uv_offset"], face_count * 4, "<i4").reshape(-1, 4)
+                corner_uvs = face_uv[corner_mask]
             if corner_uvs.size and (corner_uvs.min() < 0 or corner_uvs.max() >= texcoord_count):
                 raise ValueError("Invalid UV payload")
             uv_layer = mesh.uv_layers.new(name="UVMap")
@@ -959,6 +981,9 @@ def receive_delta(header, binary):
     if obj is None:
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
         return
+    if sends_evaluated(obj):
+        connection.error = MODIFIER_MESSAGE
+        return
     write_mode = geometry_write_mode(obj)
     if write_mode is None:
         stale_objects.add(mesh_id)
@@ -1036,6 +1061,9 @@ def receive_attributes(header, binary):
         delta_cache.pop(obj.data.get(GEOMETRY_ID, ""), None)
     if obj is None:
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
+        return
+    if sends_evaluated(obj):
+        connection.error = MODIFIER_MESSAGE
         return
     write_mode = geometry_write_mode(obj)
     if write_mode is None:
@@ -1528,10 +1556,25 @@ def corner_table(loop_starts, quad, corners):
 
 
 def encode_object(obj, live=False, include_material=True, replace_topology=False):
-    mesh = obj.data
+    if not sends_evaluated(obj):
+        return encode_mesh(obj, obj.data, live, include_material, replace_topology)
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    try:
+        mesh = evaluated.to_mesh() or obj.data  # a stack that yields no mesh falls back to the base
+        return encode_mesh(obj, mesh, live, include_material, replace_topology)
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def encode_mesh(obj, mesh, live, include_material, replace_topology):
+    """mesh is obj.data, or a throwaway evaluated copy; ids and Nomad's own custom
+    properties always come from obj.data, which outlives it."""
     loop_totals = foreach_get(mesh.polygons, "loop_total", dtype=numpy.int32)
-    if loop_totals.size and (loop_totals.min() < 3 or loop_totals.max() > 4):
-        raise ValueError("Nomad Link currently supports triangle and quad faces")
+    if loop_totals.size and loop_totals.min() < 3:
+        raise ValueError("Nomad Link needs faces with at least 3 corners")
+    ngon = bool(loop_totals.size and loop_totals.max() > 4)
+    if ngon and "ngon" not in remote_capabilities:
+        raise ValueError("This peer supports triangle and quad faces only")
     loop_starts = foreach_get(mesh.polygons, "loop_start", dtype=numpy.int32)
     quad = loop_totals == 4
 
@@ -1544,7 +1587,7 @@ def encode_object(obj, live=False, include_material=True, replace_topology=False
         "type": "mesh_full",
         "request_id": uuid.uuid4().hex,
         "mesh_id": ensure_link_id(obj),
-        "geometry_id": ensure_geometry_id(mesh),
+        "geometry_id": ensure_geometry_id(obj.data),
         "name": obj.name,
         "vertex_count": len(mesh.vertices),
         "face_count": len(mesh.polygons),
@@ -1552,10 +1595,18 @@ def encode_object(obj, live=False, include_material=True, replace_topology=False
         "position_format": "float32x3",
     }
 
-    header["face_offset"] = len(binary)
-    header["face_format"] = "int32x4"
     corner_verts = foreach_get(mesh.loops, "vertex_index", dtype=numpy.int32)
-    binary.extend(corner_table(loop_starts, quad, corner_verts).tobytes())
+    if ngon:
+        header["face_format"] = "corners"
+        header["corner_count"] = len(mesh.loops)
+        header["face_size_offset"] = len(binary)
+        binary.extend(loop_totals.astype("<i4").tobytes())
+        header["corner_vertex_offset"] = len(binary)
+        binary.extend(corner_verts.astype("<i4").tobytes())
+    else:
+        header["face_offset"] = len(binary)
+        header["face_format"] = "int32x4"
+        binary.extend(corner_table(loop_starts, quad, corner_verts).tobytes())
 
     uv_layer = mesh.uv_layers.active
     if uv_layer:
@@ -1565,9 +1616,13 @@ def encode_object(obj, live=False, include_material=True, replace_topology=False
         header["texcoord_offset"] = len(binary)
         header["texcoord_format"] = "float32x2"
         binary.extend(uv_values.astype("<f4").tobytes())
-        header["face_uv_offset"] = len(binary)
         loop_indices = numpy.arange(len(mesh.loops), dtype=numpy.int32)
-        binary.extend(corner_table(loop_starts, quad, loop_indices).tobytes())
+        if ngon:
+            header["corner_texcoord_offset"] = len(binary)
+            binary.extend(loop_indices.astype("<i4").tobytes())
+        else:
+            header["face_uv_offset"] = len(binary)
+            binary.extend(corner_table(loop_starts, quad, loop_indices).tobytes())
 
     colors = vertex_colors(mesh)
     if colors is not None:
@@ -1597,7 +1652,7 @@ def encode_object(obj, live=False, include_material=True, replace_topology=False
         header["face_group_format"] = "uint16"
         binary.extend(numpy.clip(values, 0, 65535).astype("<u2").tobytes())
         try:
-            header["face_groups"] = json.loads(mesh.get("nomad_face_groups", "[]"))
+            header["face_groups"] = json.loads(obj.data.get("nomad_face_groups", "[]"))
         except (TypeError, ValueError):
             header["face_groups"] = []
 
@@ -1625,8 +1680,10 @@ def encode_object(obj, live=False, include_material=True, replace_topology=False
             binary.extend(records.tobytes())
         header["layer_active"] = obj.active_shape_key_index - 1  # Basis = Nomad's base = -1
 
-    sent_geometry.add(header["geometry_id"])
-    if shape_keys:
+    # an evaluated mesh is nobody's shared geometry, and its vertices are not obj.data's
+    if mesh is obj.data:
+        sent_geometry.add(header["geometry_id"])
+    if shape_keys or mesh is not obj.data:
         delta_cache.pop(header["geometry_id"], None)
     else:
         delta_cache[header["geometry_id"]] = {
@@ -1670,6 +1727,7 @@ def send_object(obj, live=False, replace_topology=False):
         force_full_ids.discard(link_id)
     elif (
         "mesh_instance" in remote_capabilities
+        and not sends_evaluated(obj)
         and obj.data.get(GEOMETRY_ID) in sent_geometry
         and geometry_sibling(obj) is not None
     ):
@@ -1688,7 +1746,7 @@ def send_sculpt_delta(obj):
     if "mesh_delta_receive" not in remote_capabilities:
         return False
     mesh = obj.data
-    if mesh.shape_keys:
+    if mesh.shape_keys or sends_evaluated(obj):
         return False
     mesh_id = ensure_link_id(obj)
     cache = delta_cache.get(ensure_geometry_id(mesh))
@@ -1807,7 +1865,7 @@ def send_light(obj, live=False):
     if data.type == "SUN":
         header["angle"] = data.angle
     if data.type in {"POINT", "SPOT"}:
-        header["size"] = data.size
+        header["size"] = data.radius if hasattr(data, "radius") else data.shadow_soft_size
     # Nomad suns read "intensity" (normalized), the other types "power" (world space).
     # Fields Blender cannot represent (factor) are omitted so Nomad keeps them.
     header["intensity" if data.type == "SUN" else "power"] = data.energy
@@ -2864,6 +2922,7 @@ class NOMAD_PT_link(bpy.types.Panel):
         if scene.nomad_link_live_sync and not linked_object_count(scene):
             live.label(text="Use Send or Get once to link existing objects", icon="INFO")
 
+        layout.prop(scene, "nomad_link_send_modifiers")
         layout.prop(scene, "nomad_link_auto_update")
         for scope, label, _description in SCOPE_ITEMS:
             count = len(scope_objects(scene, scope))
@@ -2908,6 +2967,14 @@ def register():
             ("SCENE_CAMERA", "Scene Camera", "Use the scene camera object"),
         ),
         default="VIEWPORT",
+    )
+    bpy.types.Scene.nomad_link_send_modifiers = bpy.props.BoolProperty(
+        name="Send Modifier Results",
+        description=(
+            "Send the evaluated result of the modifier stack instead of the base mesh. When "
+            "enabled, transfers are limited to Blender → Nomad; Nomad → Blender is unavailable"
+        ),
+        default=False,
     )
     bpy.types.Scene.nomad_link_live_sync = bpy.props.BoolProperty(
         name="Live Sync", default=False, update=settings_changed
@@ -2960,6 +3027,7 @@ def unregister():
     del bpy.types.Scene.nomad_link_sync_view
     del bpy.types.Scene.nomad_link_sync_mode
     del bpy.types.Scene.nomad_link_live_sync
+    del bpy.types.Scene.nomad_link_send_modifiers
     del bpy.types.Scene.nomad_link_camera_target
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

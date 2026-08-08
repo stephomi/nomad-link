@@ -63,7 +63,10 @@ A bridge can use either method or accept an address from the user.
 - **Lights and cameras** aim along their local **-Z** axis with +Y up (glTF convention).
   Convert their `world_matrix` directly between coordinate systems. Do not convert it
   like a mesh transform.
-- **Faces**: triangles and quads only, as `int32x4`; a triangle sets the 4th index to -1.
+- **Faces**: `int32x4` by default — triangles and quads only, a triangle sets the 4th
+  index to -1. Peers advertising `ngon` also accept `face_format: "corners"`, which
+  carries any face size (§7.1). Nomad currently splits n-gons into tris/quads on
+  arrival, so a mesh sent as `corners` comes back as `int32x4`.
 - **Ids**: `mesh_id` / `link_id` / `geometry_id` are opaque strings chosen by whichever
   side names the entity first. UUIDs are recommended. Keep them for the life of the
   link.
@@ -122,6 +125,7 @@ Both sides send capabilities. Use only capabilities advertised by the peer.
 | `mesh_delta_receive` | advertiser accepts incoming sparse `mesh_delta`; without it send `mesh_full` |
 | `mesh_attributes_receive` | advertiser accepts incoming `mesh_attributes` |
 | `mesh_instance` | peer understands shared-geometry instances (§8) |
+| `ngon` | peer accepts `face_format: "corners"` (§7.1.1); without it, split n-gons before sending |
 | `display_config` | peer applies display settings (§10.1); Nomad only sends them to peers advertising this |
 | `texture` | peer caches texture blobs by immutable id (§10.2); Nomad only sends blobs to peers advertising this |
 
@@ -207,7 +211,7 @@ Complete mesh state in one frame.
     "position_offset": 0,                 // ⭐ node-local positions, 8 × 12 B
     "position_format": "float32x3",
     "face_offset": 96,                    // ⭐ tris + quads; triangle: 4th index -1
-    "face_format": "int32x4",             //   6 × 16 B
+    "face_format": "int32x4",             //   6 × 16 B, n-gons use "corners" (§7.1.1)
 
     "texcoord_count": 14,                 // UVs — the four fields travel together
     "texcoord_offset": 192,               // 14 × 8 B; v origin is top-left (glTF style),
@@ -282,6 +286,28 @@ Complete mesh state in one frame.
 
 Reply with `{"type": "mesh_ack", "mesh_id": ..., "request_id": ...}`. The sender uses
 the returned `mesh_id` as the object's link id.
+
+### 7.1.1 `face_format: "corners"` — n-gons
+
+Only for peers advertising `ngon`; otherwise split the n-gons and send `int32x4`.
+The four fields replace `face_offset` / `face_uv_offset`, everything else is unchanged —
+`face_count` still indexes `face_group_offset`, and the corners of face `i` are the
+`face_size[i]` entries starting at the sum of the preceding sizes.
+
+```jsonc
+{
+    "face_format": "corners",
+    "face_count": 6,                      // as usual
+    "corner_count": 26,                   // = Σ face sizes
+    "face_size_offset": 96,               // int32 per face, >= 3, 6 × 4 B
+    "corner_vertex_offset": 120,          // int32 per corner, 26 × 4 B
+    "corner_texcoord_offset": 224         // int32 per corner, required with texcoords
+}
+```
+
+Nomad accepts this format but has no n-gons of its own yet: each is split into
+tris/quads on arrival (face groups follow the split), so a round trip returns
+`int32x4`. Peers that keep the topology should not re-send what they receive.
 
 ### 7.2 `mesh_delta` — sparse updates (both directions)
 
