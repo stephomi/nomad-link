@@ -12,8 +12,10 @@ The extension supports:
 - one explicit live scene writer and one explicit working-view writer;
 - full object transforms, with skew split across a generated parent Empty;
 - UVs, visible vertex color/opacity/roughness/metalness, and material defaults;
+- the sculpt mask as Blender's own mask attribute, inverted to match its convention (Nomad stores 1 = unmasked), per-vertex in both directions including live strokes;
+- hidden faces as Blender's `.hide_poly`;
 - Nomad sculpt layers as Blender shape keys;
-- face groups as the `nomad_face_group` face-domain integer attribute;
+- face groups as the `nomad_face_group` face-domain integer attribute, mirrored into Blender's sculpt face sets (offset by one, since face set 0 means "none") so they can be isolated and masked in Sculpt Mode; editing the face sets sends them back as groups, and a mesh whose face sets were authored in Blender travels as groups too;
 - sparse Nomad sculpt and vertex-paint updates after completed strokes and undo/redo, applied live even while the linked object is in Blender's Sculpt Mode;
 - debounced Blender geometry and gizmo updates: sparse sculpt deltas while the topology is unchanged, full topology replacement otherwise;
 - debounced layer-factor and visibility updates without retransmitting topology;

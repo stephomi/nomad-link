@@ -26,9 +26,16 @@ GEOMETRY_ID = "nomad_geometry_id"
 TRANSFORM_PARENT_ID = "nomad_transform_parent_id"
 MATERIAL_ID = "nomad_link_material"
 FACE_GROUP_ATTRIBUTE = "nomad_face_group"
+FACE_SET_ATTRIBUTE = ".sculpt_face_set"  # Blender's own face sets, mirrored from the groups
+HIDE_FACE_ATTRIBUTE = ".hide_poly"  # Nomad's hidden faces
+MASK_ATTRIBUTE = ".sculpt_mask"  # inverted: Nomad stores 1 = unmasked, Blender 1 = masked
+MODAL_GRACE = 0.5  # how long a queued edit waits on a modal operator before going out anyway
+PENDING_TIMEOUT = 10.0  # a peer that never answers a request must not wedge the queue forever
+MAX_FACE_GROUP = 32767
 COLOR_ATTRIBUTE = "Nomad Color"
 ROUGHNESS_ATTRIBUTE = "nomad_roughness"
 METALNESS_ATTRIBUTE = "nomad_metalness"
+DEFAULT_ROUGHNESS = 0.25
 TO_NOMAD = Matrix.Rotation(math.radians(-90.0), 4, "X")
 TO_BLENDER = TO_NOMAD.inverted()
 
@@ -920,14 +927,16 @@ def receive_mesh(header, binary):
         if has_metalness:
             set_float_attribute(mesh, METALNESS_ATTRIBUTE, read_unit_array(binary, header["metalness_offset"], vertex_count, "u1", 255.0))
 
+        if "mask_offset" in header:
+            set_sculpt_mask(mesh, 1.0 - read_unit_array(binary, header["mask_offset"], vertex_count, "<u2", 65535.0))
+
         if "face_group_offset" in header:
             values = read_array(binary, header["face_group_offset"], face_count, "<u2")
-            previous = mesh.attributes.get(FACE_GROUP_ATTRIBUTE)
-            if previous is not None:
-                mesh.attributes.remove(previous)
-            attribute = mesh.attributes.new(name=FACE_GROUP_ATTRIBUTE, type="INT", domain="FACE")
-            attribute.data.foreach_set("value", values.astype(numpy.int32))
+            set_face_groups(mesh, values.astype(numpy.int32))
             mesh["nomad_face_groups"] = json.dumps(header.get("face_groups", []))
+
+        if "face_hidden_offset" in header:
+            set_hidden_faces(mesh, read_array(binary, header["face_hidden_offset"], face_count, "u1") != 0)
 
         mesh.update(calc_edges=True)
         if "material" in header:
@@ -1017,6 +1026,14 @@ def receive_delta(header, binary):
             positions = foreach_get(mesh.vertices, "co", 3)
             positions[moved] = targets
             mesh.vertices.foreach_set("co", positions.ravel())
+
+    if "mask_offset" in header:
+        incoming = read_unit_array(binary, header["mask_offset"], count, "<u2", 65535.0)
+        mask = sculpt_mask(mesh)
+        if mask is None:
+            mask = numpy.zeros(len(mesh.vertices), numpy.float32)
+        mask[indices[valid]] = 1.0 - incoming[valid]
+        set_sculpt_mask(mesh, mask)
 
     if "color_offset" in header:
         rgb = decode_rgbm(binary, header["color_offset"], count)
@@ -1547,6 +1564,106 @@ def point_floats(mesh, name):
     return foreach_get(attribute.data, "value")
 
 
+def int_face_attribute(mesh, name):
+    attribute = mesh.attributes.get(name)
+    if attribute is None or attribute.domain != "FACE" or attribute.data_type != "INT":
+        return None
+    return foreach_get(attribute.data, "value", dtype=numpy.int32)
+
+
+def set_face_groups(mesh, values):
+    """Nomad's groups also go into Blender's face sets, offset by one because 0 means "no face
+    set" there while Nomad's group 0 is a real group. Sculpt mode can then isolate and mask
+    them, and the untouched copy in FACE_GROUP_ATTRIBUTE is what tells us they were edited."""
+    for name, data in ((FACE_GROUP_ATTRIBUTE, values), (FACE_SET_ATTRIBUTE, values + 1)):
+        attribute = mesh.attributes.get(name)
+        if attribute is None or attribute.domain != "FACE" or attribute.data_type != "INT":
+            if attribute is not None:
+                mesh.attributes.remove(attribute)
+            attribute = mesh.attributes.new(name=name, type="INT", domain="FACE")
+        attribute.data.foreach_set("value", data)
+
+
+def sculpt_mask(mesh):
+    attribute = mesh.attributes.get(MASK_ATTRIBUTE)
+    if attribute is None or attribute.domain != "POINT" or attribute.data_type != "FLOAT":
+        return None
+    return foreach_get(attribute.data, "value")
+
+
+def set_sculpt_mask(mesh, values):
+    attribute = mesh.attributes.get(MASK_ATTRIBUTE)
+    if attribute is None:
+        attribute = mesh.attributes.new(name=MASK_ATTRIBUTE, type="FLOAT", domain="POINT")
+    attribute.data.foreach_set("value", values)
+
+
+def hidden_faces(mesh):
+    attribute = mesh.attributes.get(HIDE_FACE_ATTRIBUTE)
+    if attribute is None or attribute.domain != "FACE" or attribute.data_type != "BOOLEAN":
+        return None
+    return foreach_get(attribute.data, "value", dtype=bool)
+
+
+def set_hidden_faces(mesh, hidden):
+    attribute = mesh.attributes.get(HIDE_FACE_ATTRIBUTE)
+    if attribute is None:
+        if not hidden.any():
+            return
+        attribute = mesh.attributes.new(name=HIDE_FACE_ATTRIBUTE, type="BOOLEAN", domain="FACE")
+    attribute.data.foreach_set("value", hidden)
+
+
+def face_groups(mesh):
+    """The face sets win once they stop matching the mirror: that is the user having edited
+    them in sculpt mode. A mesh with no Nomad groups at all still sends its face sets."""
+    values = int_face_attribute(mesh, FACE_GROUP_ATTRIBUTE)
+    edited = int_face_attribute(mesh, FACE_SET_ATTRIBUTE)
+    if edited is not None and (values is None or not numpy.array_equal(edited - 1, values)):
+        values = edited - 1  # face set 0 is Blender's "none", it lands in Nomad's first group
+    if values is None:
+        return None
+    return numpy.clip(values, 0, MAX_FACE_GROUP)
+
+
+def paint_channels(mesh):
+    """Blender zero-fills attributes on the geometry it creates (a boolean drops them even when
+    both operands carry the layer), so those vertices arrive black and fully transparent. A zero
+    in every channel is the marker, painted vertices keep alpha 1 and roughness 0.25. Grow the
+    surrounding paint over them, a trim cap is one ring away from painted geometry."""
+    colors = vertex_colors(mesh)
+    roughness = point_floats(mesh, ROUGHNESS_ATTRIBUTE)
+    metalness = point_floats(mesh, METALNESS_ATTRIBUTE)
+    if colors is None:
+        return colors, roughness, metalness
+    only_zeros = ~colors.any(axis=1)
+    if roughness is not None:
+        only_zeros &= roughness == 0.0
+    if metalness is not None:
+        only_zeros &= metalness == 0.0
+    if not only_zeros.any():
+        return colors, roughness, metalness
+
+    edges = foreach_get(mesh.edges, "vertices", 2, dtype=numpy.int32)
+    edges = edges[only_zeros[edges[:, 0]] | only_zeros[edges[:, 1]]]  # the others never feed anything
+    edges = numpy.concatenate((edges, edges[:, ::-1]))  # walk both ways
+    for _ in range(8):
+        grow = only_zeros[edges[:, 0]] & ~only_zeros[edges[:, 1]]
+        if not grow.any():
+            break
+        target, source = edges[grow, 0], edges[grow, 1]
+        colors[target] = colors[source]
+        for values in (roughness, metalness):
+            if values is not None:
+                values[target] = values[source]
+        only_zeros[target] = False
+
+    colors[only_zeros] = 1.0  # nothing to grow from: Nomad's defaults, metalness is already 0
+    if roughness is not None:
+        roughness[only_zeros] = DEFAULT_ROUGHNESS
+    return colors, roughness, metalness
+
+
 def corner_table(loop_starts, quad, corners):
     table = numpy.full((len(loop_starts), 4), -1, "<i4")
     for column in range(3):
@@ -1624,7 +1741,7 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
             header["face_uv_offset"] = len(binary)
             binary.extend(corner_table(loop_starts, quad, loop_indices).tobytes())
 
-    colors = vertex_colors(mesh)
+    colors, roughness, metalness = paint_channels(mesh)
     if colors is not None:
         header["color_offset"] = len(binary)
         header["color_format"] = "rgbm8"
@@ -1633,24 +1750,33 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
         header["opacity_format"] = "uint8_norm"
         binary.extend(pack_unit(colors[:, 3], 255.0, "u1").tobytes())
 
-    roughness = point_floats(mesh, ROUGHNESS_ATTRIBUTE)
     if roughness is not None:
         header["roughness_offset"] = len(binary)
         header["roughness_format"] = "uint8_norm"
         binary.extend(pack_unit(roughness, 255.0, "u1").tobytes())
 
-    metalness = point_floats(mesh, METALNESS_ATTRIBUTE)
     if metalness is not None:
         header["metalness_offset"] = len(binary)
         header["metalness_format"] = "uint8_norm"
         binary.extend(pack_unit(metalness, 255.0, "u1").tobytes())
 
-    face_groups = mesh.attributes.get(FACE_GROUP_ATTRIBUTE)
-    if face_groups and face_groups.domain == "FACE" and face_groups.data_type == "INT":
-        values = foreach_get(face_groups.data, "value", dtype=numpy.int32)
+    mask = sculpt_mask(mesh)
+    if mask is not None:
+        header["mask_offset"] = len(binary)
+        header["mask_format"] = "uint16_norm"
+        binary.extend(pack_unit(1.0 - mask, 65535.0, "<u2").tobytes())
+
+    hidden = hidden_faces(mesh)
+    if hidden is not None:
+        header["face_hidden_offset"] = len(binary)
+        header["face_hidden_format"] = "uint8"
+        binary.extend(hidden.astype("u1").tobytes())
+
+    groups = face_groups(mesh)
+    if groups is not None:
         header["face_group_offset"] = len(binary)
         header["face_group_format"] = "uint16"
-        binary.extend(numpy.clip(values, 0, 65535).astype("<u2").tobytes())
+        binary.extend(groups.astype("<u2").tobytes())
         try:
             header["face_groups"] = json.loads(obj.data.get("nomad_face_groups", "[]"))
         except (TypeError, ValueError):
@@ -1691,6 +1817,10 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
             "corner_verts": corner_verts.copy(),
             "positions": blender_positions.copy(),
             "colors": None if colors is None else colors.copy(),
+            "masks": None if mask is None else mask.copy(),
+            # face data has no delta section: remember it so a change falls back to a full send
+            "faces": None if groups is None else groups.copy(),
+            "hidden": None if hidden is None else hidden.copy(),
         }
 
     matrix = TO_NOMAD @ obj.matrix_world @ TO_BLENDER
@@ -1704,7 +1834,7 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
     header["smooth_shading"] = any(polygon.use_smooth for polygon in mesh.polygons)
     header["live_sync"] = live
     header["replace_topology"] = replace_topology
-    pending_objects[header["request_id"]] = obj
+    pending_objects[header["request_id"]] = (obj, time.monotonic() + PENDING_TIMEOUT)
     return header, bytes(binary)
 
 
@@ -1717,7 +1847,7 @@ def send_instance(obj, live):
         "mesh_id": ensure_link_id(obj),
         **object_state(obj),
     }
-    pending_objects[header["request_id"]] = obj
+    pending_objects[header["request_id"]] = (obj, time.monotonic() + PENDING_TIMEOUT)
     connection.send(header)
 
 
@@ -1755,8 +1885,20 @@ def send_sculpt_delta(obj):
     corner_verts = foreach_get(mesh.loops, "vertex_index", dtype=numpy.int32)
     if not numpy.array_equal(corner_verts, cache["corner_verts"]):
         return False
-    colors = vertex_colors(mesh)
+    colors = paint_channels(mesh)[0]
     if (colors is None) != (cache["colors"] is None):
+        return False
+    # face groups and hidden faces only travel in a full mesh: hiding or painting a face set
+    # moves no vertex, so the delta below would report the mesh untouched and send nothing
+    for key, values in (("faces", face_groups(mesh)), ("hidden", hidden_faces(mesh))):
+        cached = cache.get(key)
+        if (values is None) != (cached is None):
+            return False
+        if values is not None and not numpy.array_equal(values, cached):
+            return False
+
+    mask = sculpt_mask(mesh)
+    if (mask is None) != (cache.get("masks") is None):
         return False
 
     positions = foreach_get(mesh.vertices, "co", 3)
@@ -1765,6 +1907,10 @@ def send_sculpt_delta(obj):
     if colors is not None:
         color_changed = numpy.any(colors != cache["colors"], axis=1)
         changed |= color_changed
+    mask_changed = None
+    if mask is not None:
+        mask_changed = mask != cache["masks"]
+        changed |= mask_changed
     indices = numpy.flatnonzero(changed)
     if not len(indices):
         return True  # base mesh untouched (Multires sculpting, modifier tweaks)
@@ -1791,12 +1937,18 @@ def send_sculpt_delta(obj):
         header["opacity_offset"] = len(binary)
         header["opacity_format"] = "uint8_norm"
         binary.extend(pack_unit(colors[indices, 3], 255.0, "u1").tobytes())
+    if mask_changed is not None and mask_changed.any():
+        header["mask_offset"] = len(binary)
+        header["mask_format"] = "uint16_norm"
+        binary.extend(pack_unit(1.0 - mask[indices], 65535.0, "<u2").tobytes())
     header["binary_size"] = len(binary)
     if not connection.send(header, bytes(binary)):
         return False
     cache["positions"][indices] = positions[indices]
     if colors is not None:
         cache["colors"][indices] = colors[indices]
+    if mask is not None:
+        cache["masks"][indices] = mask[indices]
     return True
 
 
@@ -1821,7 +1973,7 @@ def send_object_state(obj):
 
 
 def send_material(obj):
-    colors = vertex_colors(obj.data)
+    colors = vertex_colors(obj.data)  # only their presence is reported, no paint travels here
     roughness = point_floats(obj.data, ROUGHNESS_ATTRIBUTE)
     metalness = point_floats(obj.data, METALNESS_ATTRIBUTE)
     connection.send(
@@ -2183,8 +2335,8 @@ def receive_session_config(header):
     finally:
         applying_config = False
     config_desired = incoming
-    if not wants_blender_source(scene):
-        dirty_objects.clear()
+    if not scene.nomad_link_live_sync:
+        dirty_objects.clear()  # an Auto handover keeps them: they are edits Blender already made
     membership_ready = True
     last_camera = None
     for window in bpy.context.window_manager.windows:
@@ -2295,7 +2447,8 @@ def receive_packet(header, binary):
     elif message_type == "mesh_invalidated":
         connection.error = "Nomad topology changed; get the selected mesh again to refresh it"
     elif message_type == "mesh_ack":
-        obj = pending_objects.pop(header.get("request_id", ""), None)
+        pending = pending_objects.pop(header.get("request_id", ""), None)
+        obj = pending[0] if pending else None
         if obj:
             try:
                 obj[MESH_ID] = header["mesh_id"]
@@ -2419,6 +2572,17 @@ def queue_dirty(obj, flag, delay):
 
 
 @persistent
+def undo_redo_post(scene, _depsgraph=None):
+    """Undo frees and rebuilds datablocks: the queued objects and the pointer keys of
+    known_objects/visibility_states dangle, and a reused pointer would resolve to a dead entry."""
+    global membership_ready
+    dirty_objects.clear()
+    known_objects.clear()
+    visibility_states.clear()
+    membership_ready = False
+
+
+@persistent
 def depsgraph_update(scene, depsgraph):
     if connection.status != "Connected" or not wants_blender_source(scene):
         return
@@ -2481,16 +2645,19 @@ def depsgraph_update(scene, depsgraph):
 
 def flush_dirty():
     scene = bpy.context.scene
-    if not wants_blender_source(scene):
+    if not scene.nomad_link_live_sync:
         dirty_objects.clear()
         return
-    if not sends_live_scene(scene):
-        return
+    # every entry was queued while Blender owned the source, so a finished stroke still goes out
+    # after Auto hands the source to Nomad; a remote apply pops its own object from the queue
     if stale_objects:
         return
+    now = time.monotonic()
+    for request_id, (_obj, deadline) in tuple(pending_objects.items()):
+        if now >= deadline:
+            pending_objects.pop(request_id, None)  # unanswered: never let it pin the queue
     if pending_objects or pending_transfers:
         return
-    now = time.monotonic()
     modal_running = None
     for pointer, item in tuple(dirty_objects.items()):
         if now < item["after"]:
@@ -2504,9 +2671,11 @@ def flush_dirty():
             dirty_objects.pop(pointer, None)
             continue
         flags = item["flags"]
-        if obj.type == "MESH" and flags & {"geometry", "sculpt"}:
-            # A half-finished stroke must not be sent: wait for the pointer release,
-            # detected as the modal brush operator leaving window.modal_operators.
+        if obj.type == "MESH" and flags & {"geometry", "sculpt"} and now < item["after"] + MODAL_GRACE:
+            # A half-finished stroke must not be sent: wait for the pointer release, detected as
+            # the modal brush operator leaving window.modal_operators. Only until the grace ends
+            # though: every dab pushes "after" forward, so a queue that went quiet is a finished
+            # stroke, and an unfocused Blender never processes the events that end the operator.
             if modal_running is None:
                 modal_running = modal_operator_running()
             if modal_running:
@@ -3007,6 +3176,9 @@ def register():
     bpy.types.Scene.nomad_link_auto_update = bpy.props.BoolProperty(name="Automatic Updates", default=True)
     if depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if undo_redo_post not in handlers:
+            handlers.append(undo_redo_post)
     if not bpy.app.timers.is_registered(poll):
         bpy.app.timers.register(poll, first_interval=0.1, persistent=True)
 
@@ -3019,6 +3191,9 @@ def unregister():
         bpy.app.timers.unregister(poll)
     if depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if undo_redo_post in handlers:
+            handlers.remove(undo_redo_post)
     del bpy.types.Scene.nomad_link_auto_update
     del bpy.types.Scene.nomad_link_sync_cameras
     del bpy.types.Scene.nomad_link_sync_lights

@@ -241,7 +241,9 @@ Complete mesh state in one frame.
     "density_format": "uint8_norm",       //   optional working state, absent = none
 
     "face_group_offset": 480,             // per face, index into face_groups,
-    "face_group_format": "uint16",        // 6 × 2 B
+    "face_group_format": "uint16",        // 6 × 2 B, id ≤ 32767
+    "face_hidden_offset": 492,            // per face, 0 visible / 1 hidden,
+    "face_hidden_format": "uint8",        // 6 × 1 B, absent = all visible
     "face_groups": [
         { "name": "Group 1", "color": [0.8, 0.2, 0.2] }
     ],
