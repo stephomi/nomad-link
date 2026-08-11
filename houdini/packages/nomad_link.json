@@ -1,0 +1,7 @@
+{
+    "env": [
+        {"NOMAD_LINK": "$HOME/nomad-link/houdini"},
+        {"PYTHONPATH": {"value": "$NOMAD_LINK/python", "method": "append"}}
+    ],
+    "path": "$NOMAD_LINK"
+}

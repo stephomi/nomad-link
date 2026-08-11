@@ -21,6 +21,7 @@ gh release view "$ver" >/dev/null 2>&1 &&
 sed -i '' "s/^VERSION = \"[^\"]*\"/VERSION = \"$ver\"/" examples/transport.py
 sed -i '' "s/^version = \"[^\"]*\"/version = \"$ver\"/" blender/nomad_blender_link/blender_manifest.toml
 sed -i '' "s/BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$ver\"/g" ../../src/link/LinkProtocol.hpp
+cp examples/transport.py houdini/python/nomad_link/
 
 # bridges archive (stable name, /releases/latest/download/ depends on it)
 rm -f nomad-link-bridges.zip

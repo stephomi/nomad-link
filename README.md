@@ -15,6 +15,7 @@ Version **0.11.36**, protocol **1**.
 - `examples/viewer.py` — minimal read-only client, prints every scene message
 - `examples/zbrush.py` — desktop ZBrush through GoZ (run it on the ZBrush computer)
 - `examples/cozyblanket.py` — CozyBlanket retopology round trip
+- `houdini` — Houdini digital assets: a Nomad Link In SOP and a Nomad Link Out SOP
 - `blender/nomad_blender_link` — the Blender extension, and the complete reference
   client: it implements every part of the specification
 - `blender/repository` — the published extension repository (`index.json` + archive)
@@ -31,6 +32,11 @@ python3 zbrush.py --help
 
 In Nomad, open the **Link** menu to start the server. The bridge finds it on the local
 network; approve the connection request in Nomad.
+
+## Houdini assets
+
+Copy `houdini/packages/nomad_link.json` into `$HOUDINI_USER_PREF_DIR/packages`, then
+build the assets once with `hython houdini/build_hda.py`. See `houdini/README.md`.
 
 ## Blender extension
 

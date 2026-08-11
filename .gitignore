@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
 nomad-link-bridges.zip
+houdini/otls/backup/
+houdini/tests/.test_tokens.json
