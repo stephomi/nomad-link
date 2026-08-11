@@ -81,6 +81,31 @@ Not implemented: materials and textures, lights, cameras, view sync, sculpt
 layers, and outgoing `mesh_delta` — every Houdini send is a full mesh, which is
 one undo step in Nomad. The capabilities in the `hello` are honest about this.
 
+## Troubleshooting
+
+**`Permission denied` copying the package file (macOS).** The Houdini installer
+runs as root and can leave the preferences folder owned by root, so your user
+cannot write into it. Give it back to yourself, then copy again:
+
+```
+sudo chown -R $(whoami):staff ~/Library/Preferences/houdini
+```
+
+**The nodes are not in the tab menu.** `NOMAD_LINK` in the copied
+`nomad_link.json` is not pointing at this `houdini` folder, or the package file
+landed in the wrong version folder. Houdini's *Windows → Shell* will show what
+it loaded: `hou.hda.loadedFiles()` should list `nomad_link.hda`.
+
+**Connect finds nothing.** Discovery needs both devices on the same network, and
+an iPad will not answer a UDP broadcast when it is asleep. Open Nomad's **Link**
+menu first, then type the device's address into **Host** if discovery still
+fails — the address is shown in that menu.
+
+**Meshes arrive inside-out.** Toggle **Flip Winding** on the node in question.
+
+**The In SOP does not update while sculpting.** Check that Nomad's Link menu has
+live sync on, and that the node's **Status** still reads `Connected`.
+
 ## Building the assets from source
 
 Only needed to change the node interface — everyday use and editing the Python
