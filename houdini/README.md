@@ -15,8 +15,10 @@ node in the session.
 
 The assets are prebuilt — there is nothing to compile.
 
-1. Put this repository (or just its `houdini` folder) somewhere permanent, such
-   as `~/nomad-link`.
+1. Download
+   **[nomad-link-houdini.zip](https://github.com/stephomi/nomad-link/releases/latest/download/nomad-link-houdini.zip)**
+   and unzip it into your home folder, giving `~/nomad-link-houdini`. (Cloning
+   the repository works too — then this is its `houdini` folder.)
 2. Copy `packages/nomad_link.json` into your Houdini packages folder, creating
    it if it does not exist:
 
@@ -27,8 +29,8 @@ The assets are prebuilt — there is nothing to compile.
    | Windows | `%USERPROFILE%\Documents\houdini22.0\packages` |
 
    Use whichever version folder matches your Houdini.
-3. If the folder from step 1 is not `$HOME/nomad-link/houdini`, open that copied
-   `nomad_link.json` in a text editor and point `NOMAD_LINK` at it.
+3. If step 1 put the folder anywhere other than `~/nomad-link-houdini`, open the
+   copied `nomad_link.json` in a text editor and point `NOMAD_LINK` at it.
 4. Start Houdini. **Nomad Link In** and **Nomad Link Out** are in the SOP tab
    menu.
 

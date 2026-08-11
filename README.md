@@ -35,10 +35,11 @@ network; approve the connection request in Nomad.
 
 ## Houdini assets
 
-The assets are prebuilt: copy `houdini/packages/nomad_link.json` into your Houdini
-packages folder (`$HOUDINI_USER_PREF_DIR/packages`), pointing `NOMAD_LINK` inside it at
-this folder, and **Nomad Link In** / **Nomad Link Out** appear in the SOP tab menu. See
-`houdini/README.md`.
+Download **[nomad-link-houdini.zip](https://github.com/stephomi/nomad-link/releases/latest/download/nomad-link-houdini.zip)**
+and unzip it into your home folder. The assets are prebuilt: copy the enclosed
+`packages/nomad_link.json` into your Houdini packages folder
+(`$HOUDINI_USER_PREF_DIR/packages`) and **Nomad Link In** / **Nomad Link Out** appear in
+the SOP tab menu. See `houdini/README.md`.
 
 ## Blender extension
 
