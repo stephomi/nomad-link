@@ -60,6 +60,21 @@ A bridge can use either method or accept an address from the user.
   the node. For skewed transforms, Nomad may also send `world_matrix_parent` and
   `local_matrix` (world = parent × local; both are skew-free). Use the split if needed,
   otherwise use `world_matrix`.
+- **Hierarchy**: `parent_id` holds the parent's `link_id`; `""` is the scene root. An
+  **absent** `parent_id` leaves the receiver's parenting untouched, so messages from a peer
+  that does not model hierarchy never flatten a tree. When it is present,
+  `world_matrix_parent` is that parent's world matrix and `local_matrix` is relative to it;
+  prefer the pair, `world_matrix` stays the flattened value for peers without hierarchy.
+  When it is absent, the pair is the skew split above. A `local_matrix` that is itself
+  skewed splits again, and the extra frame belongs between the parent and the node.
+  To a peer without the `skew` capability, a skewed **root** object is sent under a
+  synthetic `group` whose id is `<link_id>/skew` and whose `world_matrix` is the skew
+  frame — a lone object cannot hold skew in every application. The synthetic group is
+  wire-only bookkeeping: a peer that can represent skew treats a `/skew` `parent_id` as
+  the root, ignores `group`/`object_state`/`object_delete` about `/skew` ids, and trusts
+  the child's own messages.
+- **Sibling order**: `child_index` is advisory. Peers that order siblings apply it, peers
+  that do not ignore it. It never affects transforms.
 - **Lights and cameras** aim along their local **-Z** axis with +Y up (glTF convention).
   Convert their `world_matrix` directly between coordinate systems. Do not convert it
   like a mesh transform.
@@ -125,6 +140,9 @@ Both sides send capabilities. Use only capabilities advertised by the peer.
 | `mesh_delta_receive` | advertiser accepts incoming sparse `mesh_delta`; without it send `mesh_full` |
 | `mesh_attributes_receive` | advertiser accepts incoming `mesh_attributes` |
 | `mesh_instance` | peer understands shared-geometry instances (§8) |
+| `hierarchy` | peer applies `parent_id` / `child_index` and understands `group` (§10) |
+| `scene_batch` | peer applies a `scene_batch` (§10) as one undoable step |
+| `skew` | peer represents skewed matrices directly; without it, skewed roots arrive wrapped (§3) |
 | `ngon` | peer accepts `face_format: "corners"` (§7.1.1); without it, split n-gons before sending |
 | `display_config` | peer applies display settings (§10.1); Nomad only sends them to peers advertising this |
 | `texture` | peer caches texture blobs by immutable id (§10.2); Nomad only sends blobs to peers advertising this |
@@ -201,7 +219,11 @@ Complete mesh state in one frame.
     "binary_size": 620,                   // ⭐ must equal the binary payload size
     "coordinate_system": "nomad_y_up",    // ⭐
     "world_matrix": [ /* 16 floats */ ],  // ⭐ column-major (+ skew split, §3)
+    "parent_id": "1b7e…",                 // hierarchy (§3); travels with child_index and
+    "child_index": 2,                     //   the matrix pair, exactly as in object_state
     "smooth_shading": true,               // ⭐
+    "visible": true,                      // absent = leave as-is (new objects visible)
+    "locked": false,                      // object lock (read-only content), absent = leave as-is
     "live_sync": false,                   // ⭐ §6
     "request_id": "…",                    // echoed by mesh_ack / error
     "replace_topology": true,             // allow replacing topology/UVs/layers of the
@@ -392,7 +414,10 @@ has been sent, send its other instances as:
     "geometry_id": "...",
     "name": "...",
     "visible": true,
+    "locked": false,
     "world_matrix": [...],
+    "parent_id": "...",
+    "child_index": 2,
     "live_sync": ...,
     "request_id": "..."
 }
@@ -409,6 +434,9 @@ If an existing node receives a different `geometry_id` in `mesh_full`, detach it
 its old group. If it receives new topology with the same `geometry_id`, replace the
 geometry for the whole group. Send one delta per shared geometry, not per instance.
 
+Instances share geometry, not hierarchy. There is no instanced subtree: a peer that
+instances a whole branch sends every copy as its own nodes.
+
 ## 9. Recovery
 
 - After any `error`, clear delta and known-instance caches. Send `mesh_full` next.
@@ -419,6 +447,8 @@ geometry for the whole group. Send one delta per shared geometry, not per instan
 - If a live edit cannot be applied, mark the object stale and do not send its geometry.
   When it becomes writable, request a targeted `mesh_full`. Do not claim sync while any
   local object is stale.
+- An unknown `parent_id` is not an error: keep the node at the root with its
+  `world_matrix` and re-parent it when the parent arrives. Never drop it.
 - Legacy `mesh_invalidated` requests a refresh. Legacy `request_active_mesh` requests
   the current selection.
 
@@ -434,19 +464,51 @@ Values shown are defaults. Map supported fields and ignore the rest.
     "link_id": "6f9c…",
     "name": "Sphere",
     "visible": true,
+    "locked": false,                     // object lock (read-only content)
+    "parent_id": "1b7e…",                // §3; "" = root, absent = leave parenting alone
+    "child_index": 2,                    // §3, advisory sibling order
     "world_matrix": [ /* 16 floats, column-major */ ],
-    "world_matrix_parent": [ /* … */ ],  // both only present when world_matrix
-    "local_matrix": [ /* … */ ],         // has skew (§3); world = parent × local
+    "world_matrix_parent": [ /* … */ ],  // the parent's world when parent_id is set,
+    "local_matrix": [ /* … */ ],         // else the skew split; world = parent × local
     "smooth_shading": true,              // meshes only
     "live_sync": true
 }
 ```
 
-`object_delete`:
+`group` — a transform-only node (Nomad group, Blender empty). It carries no geometry and
+needs no ack. Peers without `hierarchy` ignore it and keep every object at the root:
+
+```jsonc
+{
+    "type": "group",
+    // …object_state fields: link_id, name, visible, parent_id, child_index, matrices, live_sync…
+}
+```
+
+`object_delete` — removes the node **and its children**. To keep the children, re-parent
+them first, in the same `scene_batch` when the peer supports it:
 
 ```jsonc
 { "type": "object_delete", "link_id": "6f9c…", "live_sync": true }
 ```
+
+`scene_batch` — one frame applied in array order as a single undoable step. Scene-graph
+edits touch many nodes at once, and the order inside the batch is what makes them safe:
+a re-parent must land before the delete that orphans it.
+
+```jsonc
+{
+    "type": "scene_batch",
+    "live_sync": true,
+    "messages": [ /* object_state | group | object_delete | material | light | camera_object */ ]
+}
+```
+
+- Entries never carry binary, so `mesh_full` and `mesh_delta` stay outside a batch.
+- Validate the whole batch first; reject it entirely if an entry would parent a node under
+  its own descendant. Apply nothing on rejection and reply with `error`.
+- Split a batch that would exceed the JSON limit; each part is its own step.
+- Send the entries individually to peers without `scene_batch`, re-parents first.
 
 `material` — the same `material` object is embedded in `mesh_full` headers:
 
@@ -640,7 +702,8 @@ same bytes. Cache blobs for the session and do not request an id already cached.
 
 **Viewer**: framing, `hello` and pairing, apply
 `mesh_full`, `mesh_instance`, `object_state`, `object_delete`; optionally `mesh_delta`,
-`material`, `light`, `camera`. Advertise only what you handle.
+`material`, `light`, `camera`. Advertise only what you handle. Hierarchy is optional:
+without it, place every object by `world_matrix` and ignore `parent_id` and `group`.
 
 **Editor**: also send `mesh_full` with your own `mesh_id` and `geometry_id`,
 handle `mesh_ack`, `request_*`, `session_config`/`claim_sync`, follow §9, and send one
