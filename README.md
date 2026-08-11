@@ -35,8 +35,10 @@ network; approve the connection request in Nomad.
 
 ## Houdini assets
 
-Copy `houdini/packages/nomad_link.json` into `$HOUDINI_USER_PREF_DIR/packages`, then
-build the assets once with `hython houdini/build_hda.py`. See `houdini/README.md`.
+The assets are prebuilt: copy `houdini/packages/nomad_link.json` into your Houdini
+packages folder (`$HOUDINI_USER_PREF_DIR/packages`), pointing `NOMAD_LINK` inside it at
+this folder, and **Nomad Link In** / **Nomad Link Out** appear in the SOP tab menu. See
+`houdini/README.md`.
 
 ## Blender extension
 

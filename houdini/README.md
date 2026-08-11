@@ -13,20 +13,27 @@ node in the session.
 
 ## Install
 
-1. Put this repository (or just its `houdini` folder) somewhere permanent.
-2. Copy `packages/nomad_link.json` into `$HOUDINI_USER_PREF_DIR/packages`
-   (`~/Library/Preferences/houdini/22.0/packages` on macOS). Edit `NOMAD_LINK`
-   inside it if the folder is not `$HOME/nomad-link/houdini`.
-3. Build the two assets once:
+The assets are prebuilt — there is nothing to compile.
 
-```
-hython houdini/build_hda.py
-```
+1. Put this repository (or just its `houdini` folder) somewhere permanent, such
+   as `~/nomad-link`.
+2. Copy `packages/nomad_link.json` into your Houdini packages folder, creating
+   it if it does not exist:
 
-That writes `otls/nomad_link.hda`, which the package file already puts on
-`HOUDINI_PATH`. A prebuilt copy is committed, so this is only needed after
-changing the parameter interface; the Python is loaded live from
-`houdini/python/nomad_link`.
+   | | |
+   |---|---|
+   | macOS | `~/Library/Preferences/houdini/22.0/packages` |
+   | Linux | `~/houdini22.0/packages` |
+   | Windows | `%USERPROFILE%\Documents\houdini22.0\packages` |
+
+   Use whichever version folder matches your Houdini.
+3. If the folder from step 1 is not `$HOME/nomad-link/houdini`, open that copied
+   `nomad_link.json` in a text editor and point `NOMAD_LINK` at it.
+4. Start Houdini. **Nomad Link In** and **Nomad Link Out** are in the SOP tab
+   menu.
+
+That one file puts both the assets and the Python on Houdini's path; nothing is
+copied into your Houdini preferences.
 
 ## Use
 
@@ -73,6 +80,20 @@ Both node types carry the same connection parameters, so you only connect once.
 Not implemented: materials and textures, lights, cameras, view sync, sculpt
 layers, and outgoing `mesh_delta` — every Houdini send is a full mesh, which is
 one undo step in Nomad. The capabilities in the `hello` are honest about this.
+
+## Building the assets from source
+
+Only needed to change the node interface — everyday use and editing the Python
+never require it, because `otls/nomad_link.hda` is committed and the Python is
+loaded live from `houdini/python/nomad_link`.
+
+```
+hython houdini/build_hda.py
+```
+
+`build_hda.py` is the definition of both nodes: their parameters, the wrangles
+inside *Nomad Link Out*, and the Python SOPs that call into the package. It
+rewrites `otls/nomad_link.hda` in place.
 
 ## Layout
 
