@@ -24,6 +24,8 @@ VERSION = tomllib.loads((Path(__file__).resolve().parent / "blender_manifest.tom
 # stamped at import from the file's mtime: if the panel shows an older time than your last
 # edit, Blender is still running stale code — reload the addon
 BUILD = time.strftime("%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mtime))
+# repo id rides in the package name: the local "Nomad Dev" repo gets the build stamp, users don't
+DEV = __package__.split(".")[1] == "blender" if __package__.startswith("bl_ext.") else True
 MESH_ID = "nomad_mesh_id"
 GEOMETRY_ID = "nomad_geometry_id"
 TRANSFORM_PARENT_ID = "nomad_transform_parent_id"  # legacy, purged on connect (skew rides matrix_parent_inverse now)
@@ -70,6 +72,7 @@ force_full_ids = set()
 sent_geometry = set()
 delta_cache = {}
 deferred_parents = {}  # link_id -> parent link_id whose object has not arrived yet (PROTOCOL §9)
+undo_pending = False  # a drained packet changed blend data: poll pushes one undo step for it
 KEEP_PARENT = object()  # sentinel: the header carried no parent_id, leave the parenting alone
 remote_capabilities = set()
 session_devices = []  # connected device names, the Nomad host first (relayed peers after)
@@ -282,10 +285,12 @@ def set_parent_keep_world(node, parent):
 def purge_legacy_transform_empties():
     """MIGRATION: older versions carried a skewed matrix by parenting the object under a
     hidden '<name> Transform' empty; the frame rides matrix_parent_inverse now."""
+    global undo_pending
     for empty in [obj for obj in bpy.data.objects if obj.get(TRANSFORM_PARENT_ID)]:
         for child in tuple(empty.children):
             set_parent_keep_world(child, empty.parent)
         bpy.data.objects.remove(empty, do_unlink=True)
+        undo_pending = True
 
 
 def resolve_deferred_parents():
@@ -919,6 +924,8 @@ def make_material(mesh, header, has_color, has_roughness, has_metalness, link_id
 
 
 def receive_mesh(header, binary):
+    global undo_pending
+    undo_pending = True
     vertex_count = int(header["vertex_count"])
     face_count = int(header["face_count"])
     if int(header.get("binary_size", -1)) != len(binary):
@@ -1307,11 +1314,13 @@ def camera_ortho_scale(data, scene):
 
 
 def receive_instance(header):
+    global undo_pending
     mesh_id = header["mesh_id"]
     source = find_geometry_object(header.get("geometry_id", ""))
     if source is None:
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
         return
+    undo_pending = True
     obj = find_linked_object(mesh_id)
     if obj is None:
         obj = bpy.data.objects.new(header.get("name", source.name), source.data)
@@ -2094,6 +2103,8 @@ def send_group(obj, live):
 
 
 def receive_group(header):
+    global undo_pending
+    undo_pending = True
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
     if obj is None:
@@ -2377,10 +2388,12 @@ def receive_camera_object(header):
 
 
 def receive_delete(header):
+    global undo_pending
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
     if obj is None:
         return
+    undo_pending = True
     # PROTOCOL §10: a delete takes the subtree. Survivors are re-parented by the messages
     # ordered before this one, inside the same scene_batch
     doomed = []
@@ -2691,10 +2704,16 @@ def poll_membership():
     if not membership_ready:
         purge_legacy_transform_empties()  # before the baseline, so they never sync as groups
     scene = bpy.context.scene
-    objects = {obj.as_pointer(): obj for obj in scene.objects if supported_object(obj)}
-    current = {
-        pointer: (obj.get(MESH_ID, ""), obj.type) for pointer, obj in objects.items()
-    }
+    # wrappers are borrowed: resolved at use, never collected (dead wrapper teardown = GC crash)
+    current = {}
+    changed = []
+    for obj in scene.objects:
+        if not supported_object(obj):
+            continue
+        pointer = obj.as_pointer()
+        current[pointer] = (obj.get(MESH_ID, ""), obj.type)
+        if known_objects.get(pointer) != current[pointer]:
+            changed.append(pointer)
     stale_objects.intersection_update(link_id for link_id, _kind in current.values() if link_id)
     if connection.status != "Connected" or not wants_blender_source(scene):
         known_objects = current
@@ -2707,12 +2726,12 @@ def poll_membership():
     if not sends_live_scene(scene) or stale_objects:
         return
 
-    for pointer, obj in objects.items():
-        if pointer in known_objects and known_objects[pointer] == current[pointer]:
+    for pointer in changed:
+        obj = find_object_by_pointer(pointer)  # fresh wrapper, used and dropped here
+        if obj is None or not channel_enabled(scene, obj):
             continue
-        if channel_enabled(scene, obj):
-            send_supported(obj, live=True, replace_topology=obj.type == "MESH")
-            current[pointer] = (ensure_link_id(obj), obj.type)
+        send_supported(obj, live=True, replace_topology=obj.type == "MESH")
+        current[pointer] = (ensure_link_id(obj), obj.type)
     for pointer, (link_id, object_type) in known_objects.items():
         if (
             (pointer in current and current[pointer] == (link_id, object_type))
@@ -2833,11 +2852,11 @@ def flush_dirty():
     if pending_objects or pending_transfers:
         return
     modal_running = None
-    in_scene = {obj.as_pointer(): obj for obj in scene.objects}
     for pointer, item in tuple(dirty_objects.items()):
         if now < item["after"]:
             continue
-        obj = in_scene.get(pointer)
+        # borrowed wrapper, resolved at use: never pinned across the sends below
+        obj = next((o for o in scene.objects if o.as_pointer() == pointer), None)
         if obj is None or not supported_object(obj):
             dirty_objects.pop(pointer, None)
             continue
@@ -2948,11 +2967,17 @@ def poll():
                 receive_packet(header, binary)
         except Exception as exc:
             connection.error = str(exc)
+    global undo_pending
     try:
         if deferred_parents:
             resolve_deferred_parents()  # a parent that arrived later in this drain
         if latest_camera is not None:
             receive_camera(latest_camera)
+        if undo_pending:
+            # received edits must be a real undo step: undoing across untracked data
+            # mutations frees live IDs and the depsgraph rebuild dies on them
+            undo_pending = False
+            bpy.ops.ed.undo_push(message="Nomad Link")
         if connection.status == "Connected":
             flush_transfers()
             poll_membership()
@@ -3215,7 +3240,7 @@ class NOMAD_PT_link(bpy.types.Panel):
             ]
             status += " — " + ", ".join(names)
         layout.label(text=f"Status: {status}")
-        layout.label(text=f"Extension: {VERSION} · {BUILD}")
+        layout.label(text=f"Extension: {VERSION} · {BUILD}" if DEV else f"Extension: {VERSION}")
         if connection.error:
             layout.label(text=connection.error, icon="ERROR")
         if update_required:
