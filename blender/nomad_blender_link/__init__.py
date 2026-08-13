@@ -28,6 +28,7 @@ BUILD = time.strftime("%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mti
 DEV = __package__.split(".")[1] == "blender" if __package__.startswith("bl_ext.") else True
 MESH_ID = "nomad_mesh_id"
 GEOMETRY_ID = "nomad_geometry_id"
+REPEAT_TAG = "nomad_repeat"
 TRANSFORM_PARENT_ID = "nomad_transform_parent_id"  # legacy, purged on connect (skew rides matrix_parent_inverse now)
 MATERIAL_ID = "nomad_link_material"
 FACE_GROUP_ATTRIBUTE = "nomad_face_group"
@@ -157,6 +158,8 @@ def ensure_link_id(obj):
     if not link_id or duplicate:
         link_id = str(uuid.uuid4())
         obj[MESH_ID] = link_id
+        if duplicate and obj.get(REPEAT_TAG):
+            del obj[REPEAT_TAG]  # a user copy of a repeat instance is their object now
     return link_id
 
 
@@ -175,6 +178,20 @@ def geometry_sibling(obj):
     """Another linked object sharing this object's mesh datablock (a Blender instance)."""
     for other in bpy.data.objects:
         if other != obj and other.type == "MESH" and other.data == obj.data and other.get(MESH_ID):
+            return other
+    return None
+
+
+def repeat_owner(obj):
+    """The untagged linked object owning a repeat copy's shared datablock."""
+    for other in bpy.data.objects:
+        if (
+            other != obj
+            and other.type == "MESH"
+            and other.data == obj.data
+            and other.get(MESH_ID)
+            and not other.get(REPEAT_TAG)
+        ):
             return other
     return None
 
@@ -1337,6 +1354,10 @@ def receive_instance(header):
     # Nomad's active layer belongs to the mesh, Blender's active key to the object: an instance
     # left on its own index sculpts a different key than the rest of the group, or none at all
     obj.active_shape_key_index = source.active_shape_key_index
+    if header.get("repeat"):
+        obj[REPEAT_TAG] = True
+    elif obj.get(REPEAT_TAG):
+        del obj[REPEAT_TAG]
     apply_object_state(obj, header)
     sent_geometry.add(header.get("geometry_id", ""))
     dirty_objects.pop(obj.as_pointer(), None)
@@ -1947,7 +1968,7 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
     else:
         delta_cache.pop(header["geometry_id"], None)
 
-    matrix = TO_NOMAD @ obj.matrix_world @ TO_BLENDER
+    matrix = TO_NOMAD @ authored_world(obj) @ TO_BLENDER  # authored: see object_state
     if include_material:
         header["material"] = material_settings(
             obj, colors is not None, roughness is not None, metalness is not None
@@ -2081,19 +2102,27 @@ def send_sculpt_delta(obj):
 
 
 def object_state(obj):
-    matrix = TO_NOMAD @ obj.matrix_world
+    # authored, not evaluated: matrix_world lags pair-applied transforms until the next
+    # depsgraph pass, and a same-tick echo would send identity matrices back to Nomad
+    matrix = TO_NOMAD @ authored_world(obj)
     if obj.type == "MESH":
         matrix = matrix @ TO_BLENDER
     parent = link_parent(obj)
+    link_id = ensure_link_id(obj)
+    parent_id = ensure_link_id(parent) if parent is not None else ""
+    if not parent_id:
+        # parked: the wire parent has not arrived yet -- report it, not "the root",
+        # else the echo reads as a deliberate move out of that parent
+        parent_id = deferred_parents.get(link_id, "")
     return {
-        "link_id": ensure_link_id(obj),
+        "link_id": link_id,
         "name": obj.name,
         # effective viewport visibility: eye icon + monitor icon + collection state
         "visible": obj.visible_get(),
         # Nomad's object lock = Blender's selectability lock
         "locked": obj.hide_select,
         # "" is the root; child_index is advisory and Blender has no sibling order to report
-        "parent_id": ensure_link_id(parent) if parent is not None else "",
+        "parent_id": parent_id,
         "world_matrix": matrix_to_columns(matrix),
     }
 
@@ -2114,6 +2143,10 @@ def receive_group(header):
         obj[MESH_ID] = link_id
     if obj.type != "EMPTY":
         raise ValueError("Linked object is not a group")
+    if header.get("repeat"):
+        # a repeater's group: fully editable (moving it moves the whole array), the
+        # display type only tells it apart from a plain Nomad group
+        obj.empty_display_type = "ARROWS"
     apply_object_state(obj, header)
 
 
@@ -2186,6 +2219,7 @@ def send_light(obj, live=False):
 
 def send_camera_object(obj, live=False):
     data = obj.data
+    world = authored_world(obj)  # authored: see object_state
     connection.send(
         {
             "type": "camera_object",
@@ -2193,7 +2227,7 @@ def send_camera_object(obj, live=False):
             **object_state(obj),
             "orthographic": data.type == "ORTHO",
             "fov_y": math.degrees(data.angle_y),
-            "pivot": list((TO_NOMAD @ (obj.matrix_world.translation - obj.matrix_world.col[2].xyz * 5.0).to_4d()).to_3d()),
+            "pivot": list((TO_NOMAD @ (world.translation - world.col[2].xyz * 5.0).to_4d()).to_3d()),
         }
     )
 
@@ -2210,9 +2244,18 @@ def send_supported(obj, live=False, replace_topology=False):
 
 
 def scope_objects(scene, scope):
-    if scope == "SCENE":
-        return [obj for obj in scene.objects if supported_object(obj)]
-    return [obj for obj in bpy.context.selected_objects if supported_object(obj)]
+    pool = scene.objects if scope == "SCENE" else bpy.context.selected_objects
+    objects = []
+    for obj in pool:
+        if not supported_object(obj):
+            continue
+        if obj.get(REPEAT_TAG):  # a repeat copy stands in for its owner
+            obj = repeat_owner(obj)
+            if obj is None:
+                continue
+        if obj not in objects:
+            objects.append(obj)
+    return objects
 
 
 def send_scope(scene, scope):
@@ -2572,6 +2615,7 @@ def receive_packet(header, binary):
     global session_source
     message_type = header.get("type")
     if message_type == "hello":
+        global membership_ready
         pairing_wait = False
         config_revision = -1
         config_desired = None
@@ -2579,6 +2623,11 @@ def receive_packet(header, binary):
         active_source = "none"
         claim_pending = False
         connection.error = ""
+        # a fresh session starts from a fresh baseline: stale pre-disconnect bookkeeping
+        # must never be relayed as object_delete into the new session
+        known_objects.clear()
+        dirty_objects.clear()
+        membership_ready = False
         remote_capabilities.clear()
         remote_capabilities.update(header.get("capabilities", []))
         session_devices[:] = [str(header.get("client_name") or "Nomad")]
@@ -2632,6 +2681,8 @@ def receive_packet(header, binary):
         connection.error = ""
     elif message_type in {"request_active_mesh", "request_mesh", "request_selection"}:
         target = find_linked_object(header.get("link_id", ""))
+        if target is not None and target.get(REPEAT_TAG):
+            target = repeat_owner(target)  # the copy's geometry lives on its owner
         if target is not None:
             force_full_ids.add(target[MESH_ID])
             if target.as_pointer() not in pending_transfers:
@@ -2725,12 +2776,19 @@ def poll_membership():
         return
     if not sends_live_scene(scene) or stale_objects:
         return
+    linked_known = [p for p, (link_id, _kind) in known_objects.items() if link_id]
+    if len(linked_known) >= 2 and not any(p in current for p in linked_known):
+        # every tracked object vanished at once: a file switch or undo reset, not an
+        # edit -- re-baseline silently, never relay it as deletes of the peer's scene
+        known_objects = current
+        return
 
     for pointer in changed:
         obj = find_object_by_pointer(pointer)  # fresh wrapper, used and dropped here
         if obj is None or not channel_enabled(scene, obj):
             continue
-        send_supported(obj, live=True, replace_topology=obj.type == "MESH")
+        if not obj.get(REPEAT_TAG):  # a repeat copy only ever travels Nomad -> here
+            send_supported(obj, live=True, replace_topology=obj.type == "MESH")
         current[pointer] = (ensure_link_id(obj), obj.type)
     for pointer, (link_id, object_type) in known_objects.items():
         if (
@@ -2755,6 +2813,14 @@ def modal_operator_running():
 
 
 def queue_dirty(obj, flag, delay):
+    if obj.get(REPEAT_TAG):
+        # a repeat copy is Nomad's: its placement never travels back, everything else
+        # belongs to the shared datablock and goes out under its owner
+        if flag == "transform":
+            return
+        obj = repeat_owner(obj)
+        if obj is None:
+            return
     item = dirty_objects.setdefault(obj.as_pointer(), {"flags": set(), "after": 0.0})
     item["flags"].add(flag)
     item["after"] = max(item["after"], time.monotonic() + delay)
@@ -2789,11 +2855,15 @@ def depsgraph_update(scene, depsgraph):
                 and any(material == source for material in obj.data.materials)
             )
         else:
-            objects = tuple(
+            sharers = tuple(
                 obj
                 for obj in scene.objects
                 if supported_object(obj) and obj.data == source
             )
+            # a sculpted shared datablock is that sharer's stroke, not a geometry pass
+            # on the others; repeat copies defer to their owner (queue_dirty redirects)
+            sculpting = tuple(obj for obj in sharers if obj.mode == "SCULPT")
+            objects = sculpting or tuple(obj for obj in sharers if not obj.get(REPEAT_TAG))
         for obj in objects:
             if not supported_object(obj):
                 continue

@@ -144,7 +144,7 @@ Both sides send capabilities. Use only capabilities advertised by the peer.
 | `scene_batch` | peer applies a `scene_batch` (§10) as one undoable step |
 | `skew` | peer represents skewed matrices directly; without it, skewed roots arrive wrapped (§3) |
 | `ngon` | peer accepts `face_format: "corners"` (§7.1.1); without it, split n-gons before sending |
-| `display_config` | peer applies display settings (§10.1); Nomad only sends them to peers advertising this |
+| `shading_config` / `postprocess_config` | peer applies those display settings (§10.1); Nomad only sends them to peers advertising them |
 | `texture` | peer caches texture blobs by immutable id (§10.2); Nomad only sends blobs to peers advertising this |
 
 A minimal viewer needs only `hello`, `mesh_full`, and `object_state`.
@@ -167,7 +167,8 @@ Nomad owns the live-sync settings and sends revisions to clients.
     "sync_materials": true,
     "sync_lights": true,
     "sync_cameras": true,
-    "sync_display": false,       // §10.1; optional in set_session_config
+    "sync_shading": true,        // §10.1; optional in set_session_config
+    "sync_postprocess": false,   // §10.1; optional in set_session_config
     // informational — the masked active_source stays authoritative:
     "peers": ["Nomad iPad"],     // other connected devices, recipient excluded
     "source_name": "Nomad iPad"  // device currently sending live edits (may be you)
@@ -415,6 +416,7 @@ has been sent, send its other instances as:
     "name": "...",
     "visible": true,
     "locked": false,
+    "repeat": true,               // optional: procedural copy (e.g. a Nomad repeat)
     "world_matrix": [...],
     "parent_id": "...",
     "child_index": 2,
@@ -425,6 +427,10 @@ has been sent, send its other instances as:
 
 The receiver creates an object that shares the group's geometry. If its `mesh_id`
 already uses other geometry, reassign it.
+
+A `repeat` instance is owned by its sender: the receiver applies every update but
+never sends geometry, transform, or deletion under its `mesh_id`. Edits to the shared
+geometry travel under the geometry owner's `mesh_id` instead.
 
 If `geometry_id` is unknown, send `error` and
 `{"type": "request_mesh", "link_id": <mesh_id>}`. The peer must reply with
@@ -440,6 +446,9 @@ instances a whole branch sends every copy as its own nodes.
 ## 9. Recovery
 
 - After any `error`, clear delta and known-instance caches. Send `mesh_full` next.
+- A `mesh_full` naming an unknown `mesh_id` the receiver once issued, with a known
+  `geometry_id`, is a stale procedural copy: apply the geometry to that geometry's
+  owner (ignoring `world_matrix` and `parent_id`) instead of creating an object.
 - For `{"type": "request_mesh", "link_id": ...}`, send that object as `mesh_full`,
   never `mesh_instance`.
 - Without `link_id`, `request_mesh` and `request_selection` request the current
@@ -481,9 +490,13 @@ needs no ack. Peers without `hierarchy` ignore it and keep every object at the r
 ```jsonc
 {
     "type": "group",
+    "repeat": true,   // optional: a procedural container (Nomad repeater) rides the group flow
     // …object_state fields: link_id, name, visible, parent_id, child_index, matrices, live_sync…
 }
 ```
+
+A `repeat` group is fully editable — moving, renaming, re-parenting, or deleting it acts
+on the sender's repeater; its generated copies arrive as `repeat` instances under it (§8).
 
 `object_delete` — removes the node **and its children**. To keep the children, re-parent
 them first, in the same `scene_batch` when the peer supports it:
@@ -652,21 +665,23 @@ viewport and discard older pending messages.
 }
 ```
 
-### 10.1 `display_config`
+### 10.1 `shading_config`, `postprocess_config`
 
-Postprocess and shading settings. Both peers must advertise `display_config`. Live
-messages also require the `sync_display` channel.
+Display settings, one message type per kind. Both peers must advertise the matching
+capability. Live messages also require the matching channel (`sync_shading`,
+`sync_postprocess`).
 
 ```json
-{"type": "display_config", "live_sync": true, "display": { ... }}
+{"type": "shading_config", "live_sync": true, "shading": { ... }}
+{"type": "postprocess_config", "live_sync": true, "postprocess": { ... }}
 ```
 
-`display` uses the keys from Nomad settings files: shading (`shader_type`, `matcap_*`,
-`env_*`, `show_*`, `background_blur`, `lights_enable`) and postprocess (`pp_*`). Other
+`shading` holds `shader_type`, `matcap_*`, `environment_*`, `show_*`,
+`background_blur`, `lights_enable`; `postprocess` holds `postprocess_*`. Other
 applications may map only supported settings.
 
-A scene transfer also sends one `display_config` with `"live_sync": false`. Apply it
-even when `sync_display` is off.
+A scene transfer also sends one of each with `"live_sync": false`. Apply them even
+when the channel is off.
 
 ### 10.2 Textures (`texture`, `request_texture`)
 

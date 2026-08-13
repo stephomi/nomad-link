@@ -11,7 +11,32 @@ import threading
 import time
 
 
-VERSION = "0.11.37"  # bridge_version the examples report (the extension uses its manifest)
+VERSION = "0.11.38"  # bridge_version the examples report (the extension uses its manifest)
+
+# DEBUG wire dump: create the file to enable, delete it to disable
+DUMP_PATH = "/tmp/nomad_link_dump.jsonl"
+import os as _os
+
+
+def _dump(direction, header):
+    try:
+        if not _os.path.exists(DUMP_PATH):
+            return
+        for entry in header.get("messages", []):  # scene_batch: log the inner messages too
+            if isinstance(entry, dict):
+                _dump(direction + ":batch", entry)
+        row = {"t": round(time.time() % 100000, 3), "dir": direction, "type": header.get("type", "")}
+        for key in ("link_id", "mesh_id", "parent_id", "child_index", "name", "live_sync", "repeat"):
+            if key in header:
+                row[key] = header[key]
+        for key in ("world_matrix", "world_matrix_parent", "local_matrix"):
+            m = header.get(key)
+            if isinstance(m, (list, tuple)) and len(m) == 16:
+                row[key] = [round(float(v), 4) for v in m]
+        with open(DUMP_PATH, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DISCOVERY = b"NOMAD_LINK_DISCOVER 1"
 MAX_JSON = 1 << 20
@@ -178,6 +203,7 @@ class Connection:
     def send(self, header, binary=b""):
         if self.status != "Connected":
             return False
+        _dump("out", header)
         self.outgoing.put((header, binary))
         return True
 
@@ -187,6 +213,8 @@ class Connection:
             try:
                 packets.append(self.incoming.get_nowait())
             except queue.Empty:
+                for header, _binary in packets:
+                    _dump("in", header)
                 return packets
 
     @staticmethod
