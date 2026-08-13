@@ -12,9 +12,9 @@ import time
 import transport
 
 # honest hello (PROTOCOL.md §4): no selection/scene_transfer — this client never
-# answers request_*; scene_edits + display_config so Nomad sends the live traffic
+# answers request_*; scene_edits + the display configs so Nomad sends the live traffic
 CAPABILITIES = ["scene_edits", "object_state", "material", "light", "camera_object",
-                "session_config", "display_config"]
+                "session_config", "shading_config", "postprocess_config"]
 
 
 def describe(header, binary):
@@ -33,8 +33,9 @@ def describe(header, binary):
         return f"{kind:<14} {header.get('name', header.get('mesh_id', header.get('link_id', '')))!r}"
     if kind == "camera":
         return f"camera         fov={header.get('fov_y', 0):.1f}"
-    if kind == "display_config":
-        return f"display_config {len(header.get('display', {}))} settings"
+    if kind in ("shading_config", "postprocess_config"):
+        field = kind.rsplit("_", 1)[0]
+        return f"{kind} {len(header.get(field, {}))} settings"
     return kind
 
 

@@ -6,7 +6,7 @@ sync with other applications: meshes, sculpt layers, paint, materials, lights, c
 **[PROTOCOL.md](PROTOCOL.md) is the wire specification** — enough to write a bridge for
 any application, in any language.
 
-Version **0.11.36**, protocol **1**.
+Version **0.11.37**, protocol **1**.
 
 ## Contents
 

@@ -21,9 +21,15 @@ from .transport import Connection, discover, DEFAULT_CAPABILITIES
 PROTOCOL_VERSION = 1
 PACKAGE_ID = "nomad_blender_link"
 VERSION = tomllib.loads((Path(__file__).resolve().parent / "blender_manifest.toml").read_text())["version"]
+# stamped at import from the file's mtime: if the panel shows an older time than your last
+# edit, Blender is still running stale code — reload the addon
+BUILD = time.strftime("%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mtime))
+# repo id rides in the package name: the local "Nomad Dev" repo gets the build stamp, users don't
+DEV = __package__.split(".")[1] == "blender" if __package__.startswith("bl_ext.") else True
 MESH_ID = "nomad_mesh_id"
 GEOMETRY_ID = "nomad_geometry_id"
-TRANSFORM_PARENT_ID = "nomad_transform_parent_id"
+REPEAT_TAG = "nomad_repeat"
+TRANSFORM_PARENT_ID = "nomad_transform_parent_id"  # legacy, purged on connect (skew rides matrix_parent_inverse now)
 MATERIAL_ID = "nomad_link_material"
 FACE_GROUP_ATTRIBUTE = "nomad_face_group"
 FACE_SET_ATTRIBUTE = ".sculpt_face_set"  # Blender's own face sets, mirrored from the groups
@@ -40,7 +46,9 @@ TO_NOMAD = Matrix.Rotation(math.radians(-90.0), 4, "X")
 TO_BLENDER = TO_NOMAD.inverted()
 
 # "texture" on top of the shared bridge defaults: only this client handles blobs
-connection = Connection(client_name="Blender", capabilities=DEFAULT_CAPABILITIES + ["texture", "ngon"])
+connection = Connection(
+    client_name="Blender", capabilities=DEFAULT_CAPABILITIES + ["texture", "ngon", "hierarchy", "scene_batch"]
+)
 pending_objects = {}
 pending_transfers = []
 camera_pivot = None
@@ -64,10 +72,12 @@ pairing_wait = False
 force_full_ids = set()
 sent_geometry = set()
 delta_cache = {}
+deferred_parents = {}  # link_id -> parent link_id whose object has not arrived yet (PROTOCOL §9)
+undo_pending = False  # a drained packet changed blend data: poll pushes one undo step for it
+KEEP_PARENT = object()  # sentinel: the header carried no parent_id, leave the parenting alone
 remote_capabilities = set()
 session_devices = []  # connected device names, the Nomad host first (relayed peers after)
 session_source = ""  # client_name of the device sending live edits (may be this Blender)
-texture_images = {}  # texture_id -> Image datablock; ids are immutable pixel content
 texture_requested = set()  # ids with an in-flight request_texture
 pending_materials = {}  # link_id -> material settings waiting for texture blobs
 sent_textures = set()  # ids whose blob already went to Nomad this session
@@ -86,11 +96,11 @@ def preferences():
 
 
 def supported_object(obj):
-    return obj.type in {"MESH", "LIGHT", "CAMERA"} and not obj.get(TRANSFORM_PARENT_ID)
+    return obj.type in {"MESH", "LIGHT", "CAMERA", "EMPTY"}
 
 
 def channel_enabled(scene, obj):
-    if obj.type == "MESH":
+    if obj.type in {"MESH", "EMPTY"}:  # an empty is a Nomad group: it organises objects
         return scene.nomad_link_sync_objects
     if obj.type == "LIGHT":
         return scene.nomad_link_sync_lights
@@ -148,6 +158,8 @@ def ensure_link_id(obj):
     if not link_id or duplicate:
         link_id = str(uuid.uuid4())
         obj[MESH_ID] = link_id
+        if duplicate and obj.get(REPEAT_TAG):
+            del obj[REPEAT_TAG]  # a user copy of a repeat instance is their object now
     return link_id
 
 
@@ -170,6 +182,20 @@ def geometry_sibling(obj):
     return None
 
 
+def repeat_owner(obj):
+    """The untagged linked object owning a repeat copy's shared datablock."""
+    for other in bpy.data.objects:
+        if (
+            other != obj
+            and other.type == "MESH"
+            and other.data == obj.data
+            and other.get(MESH_ID)
+            and not other.get(REPEAT_TAG)
+        ):
+            return other
+    return None
+
+
 def find_geometry_object(gid):
     if not gid:
         return None
@@ -181,6 +207,17 @@ def find_geometry_object(gid):
 
 def remember_object(obj):
     known_objects[obj.as_pointer()] = (ensure_link_id(obj), obj.type)
+
+
+# The queues (dirty_objects, pending_objects, pending_transfers) hold plain pointers, never
+# Object wrappers: a wrapper kept across timer ticks outlives deletes and undo rebuilds, and
+# decref'ing one whose data is gone corrupts the Python heap -- the 2026-08-11 crash family.
+# A pointer is just an int; if it no longer resolves, the entry is silently dropped.
+def find_object_by_pointer(pointer):
+    for obj in bpy.data.objects:
+        if obj.as_pointer() == pointer:
+            return obj
+    return None
 
 
 def matrix_from_columns(values):
@@ -198,39 +235,119 @@ def find_linked_object(mesh_id):
     return None
 
 
-def apply_object_transform(obj, header):
-    generated_parent = (
-        obj.parent
-        if obj.parent is not None and obj.parent.get(TRANSFORM_PARENT_ID) == obj.get(MESH_ID)
-        else None
-    )
-    if obj.type != "MESH":
-        # Lights and cameras aim along their local -Z in both applications, so their
-        # frames map as world geometry; only meshes conjugate (vertices are swizzled).
-        if generated_parent is not None:
-            obj.parent = None
-            bpy.data.objects.remove(generated_parent, do_unlink=True)
-        obj.matrix_world = TO_BLENDER @ matrix_from_columns(header["world_matrix"])
+def link_parent(obj):
+    """The linked object obj hangs from. Anything but plain object parenting (bone,
+    vertex) has no wire form and reads as root."""
+    parent = obj.parent
+    if parent is None or obj.parent_type != "OBJECT":
+        return None
+    return parent if parent.get(MESH_ID) else None
+
+
+def is_descendant(node, ancestor):
+    while node is not None:
+        if node == ancestor:
+            return True
+        node = node.parent
+    return False
+
+
+def hierarchy_parent(obj, header):
+    """The object header["parent_id"] names, or KEEP_PARENT when the field is absent -- a peer
+    with no hierarchy must never flatten the tree. An unknown id defers (PROTOCOL §9)."""
+    if "parent_id" not in header:
+        return KEEP_PARENT
+    parent_id = header.get("parent_id") or ""
+    if not parent_id:
+        deferred_parents.pop(header.get("link_id") or header.get("mesh_id", ""), None)
+        return None
+    parent = find_linked_object(parent_id)
+    link_id = header.get("link_id") or header.get("mesh_id", "")
+    if parent is None:
+        deferred_parents[link_id] = parent_id  # stay at the root until the parent shows up
+        return KEEP_PARENT
+    deferred_parents.pop(link_id, None)
+    return parent
+
+
+def authored_world(obj):
+    """obj's world from authored data only (basis + parent inverse up the chain).
+    matrix_world is depsgraph-evaluated and lags edits made earlier in the same packet
+    drain -- reading it mid-apply bakes a stale parent frame into the child."""
+    world = obj.matrix_basis.copy()
+    node = obj
+    while node.parent is not None:
+        world = node.matrix_parent_inverse @ world
+        node = node.parent
+        world = node.matrix_basis @ world
+    return world
+
+
+def set_parent_keep_world(node, parent):
+    if node.parent is parent or parent is node or (parent is not None and is_descendant(parent, node)):
+        return  # unchanged, or it would close a loop: leave the node where it is
+    world = authored_world(node)
+    node.parent = parent
+    node.parent_type = "OBJECT"
+    if parent is None:
+        node.matrix_parent_inverse = Matrix.Identity(4)
+        node.matrix_world = world  # a root write lands in the basis directly, no parent involved
         return
-    world = TO_BLENDER @ matrix_from_columns(header["world_matrix"]) @ TO_NOMAD
-    if "world_matrix_parent" not in header or "local_matrix" not in header:
-        if generated_parent is not None:
-            obj.parent = None
-            bpy.data.objects.remove(generated_parent, do_unlink=True)
+    # the whole world goes into the parent-inverse slot: exact (skew included) and free of
+    # evaluated-matrix reads; the next object_state pair rewrites both parts cleanly
+    node.matrix_parent_inverse = authored_world(parent).inverted_safe() @ world
+    node.matrix_basis = Matrix.Identity(4)
+
+
+def purge_legacy_transform_empties():
+    """MIGRATION: older versions carried a skewed matrix by parenting the object under a
+    hidden '<name> Transform' empty; the frame rides matrix_parent_inverse now."""
+    global undo_pending
+    for empty in [obj for obj in bpy.data.objects if obj.get(TRANSFORM_PARENT_ID)]:
+        for child in tuple(empty.children):
+            set_parent_keep_world(child, empty.parent)
+        bpy.data.objects.remove(empty, do_unlink=True)
+        undo_pending = True
+
+
+def resolve_deferred_parents():
+    """Re-parent the nodes whose parent had not arrived yet."""
+    for link_id, parent_id in tuple(deferred_parents.items()):
+        obj = find_linked_object(link_id)
+        parent = find_linked_object(parent_id)
+        if obj is None or parent is None:
+            if obj is None:
+                deferred_parents.pop(link_id, None)
+            continue
+        deferred_parents.pop(link_id, None)
+        set_parent_keep_world(obj, parent)
+
+
+def apply_object_transform(obj, header):
+    parent = hierarchy_parent(obj, header)
+    if parent is not KEEP_PARENT:
+        set_parent_keep_world(obj, parent)
+    # Lights and cameras aim along their local -Z in both applications, so their frames
+    # map as world geometry; only meshes conjugate (vertices are swizzled).
+    mesh = obj.type == "MESH"
+    world = TO_BLENDER @ matrix_from_columns(header["world_matrix"])
+    if mesh:
+        world = world @ TO_NOMAD
+    if obj.parent is None or "world_matrix_parent" not in header or "local_matrix" not in header:
+        # a lone object cannot hold skew: Blender keeps the clean part. The pair at the
+        # root means the sender split a skewed matrix (§3) -- tell the user what they see
+        if obj.parent is None and "world_matrix_parent" in header:
+            connection.error = f"'{obj.name}' has a skewed transform: group it in Nomad to match"
         obj.matrix_world = world
         return
-
-    if generated_parent is None:
-        generated_parent = bpy.data.objects.new(f"{obj.name} Transform", None)
-        collection = obj.users_collection[0] if obj.users_collection else bpy.context.collection
-        collection.objects.link(generated_parent)
-        generated_parent.empty_display_type = "PLAIN_AXES"
-        generated_parent[TRANSFORM_PARENT_ID] = obj.get(MESH_ID)
-        obj.parent = generated_parent
-    parent = TO_BLENDER @ matrix_from_columns(header["world_matrix_parent"]) @ TO_NOMAD
-    local = TO_BLENDER @ matrix_from_columns(header["local_matrix"]) @ TO_NOMAD
-    generated_parent.matrix_world = parent
-    obj.matrix_parent_inverse = Matrix.Identity(4)
+    # world = frame @ local with local skew-free (PROTOCOL §3). The frame lands in
+    # matrix_parent_inverse, the slot Blender keeps between the parent and the object,
+    # so a skewed transform needs no helper object at all.
+    frame = TO_BLENDER @ matrix_from_columns(header["world_matrix_parent"]) @ TO_NOMAD
+    local = TO_BLENDER @ matrix_from_columns(header["local_matrix"])
+    if mesh:
+        local = local @ TO_NOMAD
+    obj.matrix_parent_inverse = authored_world(obj.parent).inverted_safe() @ frame
     obj.matrix_basis = local
 
 
@@ -569,16 +686,8 @@ def triplanar_group(material, channel, image, entry, interpolation, extension):
 
 
 def find_texture_image(texture_id):
-    image = texture_images.get(texture_id)
-    if image is not None:
-        try:
-            image.name  # dead datablock probe
-            return image
-        except ReferenceError:
-            del texture_images[texture_id]
     for image in bpy.data.images:
         if str(image.get("nomad_texture_id", "")) == texture_id:
-            texture_images[texture_id] = image
             return image
     return None
 
@@ -622,7 +731,6 @@ def ensure_texture_id(image):
     if not texture_id:
         texture_id = uuid.uuid4().hex
         image["nomad_texture_id"] = texture_id
-    texture_images[texture_id] = image
     return texture_id
 
 
@@ -833,6 +941,8 @@ def make_material(mesh, header, has_color, has_roughness, has_metalness, link_id
 
 
 def receive_mesh(header, binary):
+    global undo_pending
+    undo_pending = True
     vertex_count = int(header["vertex_count"])
     face_count = int(header["face_count"])
     if int(header.get("binary_size", -1)) != len(binary):
@@ -872,12 +982,18 @@ def receive_mesh(header, binary):
             raise RuntimeError("Leave Edit Mode on the linked object to receive the Nomad mesh")
     try:
         if obj is None:
-            mesh = bpy.data.meshes.new(header.get("name", "Nomad Mesh"))
+            # a known geometry_id names the group's datablock: adopt it, a second one carrying
+            # the same id splits the group for good once ensure_geometry_id re-randomises it
+            source = find_geometry_object(header.get("geometry_id", ""))
+            mesh = source.data if source is not None else bpy.data.meshes.new(header.get("name", "Nomad Mesh"))
             obj = bpy.data.objects.new(header.get("name", "Nomad Mesh"), mesh)
             bpy.context.collection.objects.link(obj)
             obj[MESH_ID] = mesh_id
+            rebuild = source is not None
         else:
             mesh = obj.data
+            rebuild = True
+        if rebuild:
             if mesh.shape_keys:
                 obj.shape_key_clear()
             mesh.clear_geometry()
@@ -965,13 +1081,16 @@ def receive_mesh(header, binary):
                 key.data.foreach_set("co", key_positions.astype(numpy.float32).ravel())
             active = int(header.get("layer_active", -1))  # -1 = base, key 0 = Basis
             obj.active_shape_key_index = min(max(active + 1, 0), len(layers))
+            # the layer is the mesh's, so every object on this datablock sculpts the same key
+            for other in bpy.data.objects:
+                if other != obj and other.type == "MESH" and other.data == mesh and other.get(MESH_ID):
+                    other.active_shape_key_index = obj.active_shape_key_index
 
         if "geometry_id" in header:
             mesh[GEOMETRY_ID] = header["geometry_id"]
-            delta_cache.pop(header["geometry_id"], None)
             sent_geometry.add(header["geometry_id"])
-        apply_object_transform(obj, header)
-        remember_object(obj)
+            remember_delta_cache(mesh) # what arrived is the baseline a Blender stroke diffs against
+        apply_object_state(obj, header)
         dirty_objects.pop(obj.as_pointer(), None)
         stale_objects.discard(mesh_id)
         stale_requested.pop(mesh_id, None)
@@ -1064,6 +1183,7 @@ def receive_delta(header, binary):
             attribute.data.foreach_set("value", values)
 
     mesh.update()
+    remember_delta_cache(mesh) # the applied result is the new baseline
     if "world_matrix" in header:
         apply_object_transform(obj, header)
     remember_object(obj)
@@ -1132,6 +1252,7 @@ def receive_attributes(header, binary):
             key.value = factor
             key.mute = not (layer.get("visible", True) and layer.get("visible_offset", True))
     obj.data.update()
+    remember_delta_cache(obj.data) # the applied paint is the new baseline
     remember_object(obj)
     if write_mode == "sculpt":
         refresh_sculpt_session(obj)
@@ -1210,11 +1331,13 @@ def camera_ortho_scale(data, scene):
 
 
 def receive_instance(header):
+    global undo_pending
     mesh_id = header["mesh_id"]
     source = find_geometry_object(header.get("geometry_id", ""))
     if source is None:
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
         return
+    undo_pending = True
     obj = find_linked_object(mesh_id)
     if obj is None:
         obj = bpy.data.objects.new(header.get("name", source.name), source.data)
@@ -1228,6 +1351,13 @@ def receive_instance(header):
         if obj.data.shape_keys:
             obj.shape_key_clear()
         obj.data = source.data
+    # Nomad's active layer belongs to the mesh, Blender's active key to the object: an instance
+    # left on its own index sculpts a different key than the rest of the group, or none at all
+    obj.active_shape_key_index = source.active_shape_key_index
+    if header.get("repeat"):
+        obj[REPEAT_TAG] = True
+    elif obj.get(REPEAT_TAG):
+        del obj[REPEAT_TAG]
     apply_object_state(obj, header)
     sent_geometry.add(header.get("geometry_id", ""))
     dirty_objects.pop(obj.as_pointer(), None)
@@ -1672,6 +1802,31 @@ def corner_table(loop_starts, quad, corners):
     return table
 
 
+def remember_delta_cache(mesh):
+    """Snapshot the baseline send_sculpt_delta diffs against, after a send or a receive.
+    Shape keys drive the vertices, so a layered mesh has no delta path to feed."""
+    gid = mesh.get(GEOMETRY_ID)
+    if not gid:
+        return
+    if mesh.shape_keys:
+        delta_cache.pop(gid, None)
+        return
+    colors = paint_channels(mesh)[0]
+    mask = sculpt_mask(mesh)
+    groups = face_groups(mesh)
+    hidden = hidden_faces(mesh)
+    delta_cache[gid] = {
+        "counts": (len(mesh.vertices), len(mesh.loops), len(mesh.polygons)),
+        "corner_verts": foreach_get(mesh.loops, "vertex_index", dtype=numpy.int32),
+        "positions": foreach_get(mesh.vertices, "co", 3),
+        "colors": colors,
+        "masks": mask,
+        # face data has no delta section: remember it so a change falls back to a full send
+        "faces": groups,
+        "hidden": hidden,
+    }
+
+
 def encode_object(obj, live=False, include_material=True, replace_topology=False):
     if not sends_evaluated(obj):
         return encode_mesh(obj, obj.data, live, include_material, replace_topology)
@@ -1809,21 +1964,11 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
     # an evaluated mesh is nobody's shared geometry, and its vertices are not obj.data's
     if mesh is obj.data:
         sent_geometry.add(header["geometry_id"])
-    if shape_keys or mesh is not obj.data:
-        delta_cache.pop(header["geometry_id"], None)
+        remember_delta_cache(mesh)
     else:
-        delta_cache[header["geometry_id"]] = {
-            "counts": (len(mesh.vertices), len(mesh.loops), len(mesh.polygons)),
-            "corner_verts": corner_verts.copy(),
-            "positions": blender_positions.copy(),
-            "colors": None if colors is None else colors.copy(),
-            "masks": None if mask is None else mask.copy(),
-            # face data has no delta section: remember it so a change falls back to a full send
-            "faces": None if groups is None else groups.copy(),
-            "hidden": None if hidden is None else hidden.copy(),
-        }
+        delta_cache.pop(header["geometry_id"], None)
 
-    matrix = TO_NOMAD @ obj.matrix_world @ TO_BLENDER
+    matrix = TO_NOMAD @ authored_world(obj) @ TO_BLENDER  # authored: see object_state
     if include_material:
         header["material"] = material_settings(
             obj, colors is not None, roughness is not None, metalness is not None
@@ -1832,9 +1977,11 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
     header["coordinate_system"] = "nomad_y_up"
     header["world_matrix"] = matrix_to_columns(matrix)
     header["smooth_shading"] = any(polygon.use_smooth for polygon in mesh.polygons)
+    header["visible"] = obj.visible_get()
+    header["locked"] = obj.hide_select
     header["live_sync"] = live
     header["replace_topology"] = replace_topology
-    pending_objects[header["request_id"]] = (obj, time.monotonic() + PENDING_TIMEOUT)
+    pending_objects[header["request_id"]] = (obj.as_pointer(), time.monotonic() + PENDING_TIMEOUT)
     return header, bytes(binary)
 
 
@@ -1847,16 +1994,18 @@ def send_instance(obj, live):
         "mesh_id": ensure_link_id(obj),
         **object_state(obj),
     }
-    pending_objects[header["request_id"]] = (obj, time.monotonic() + PENDING_TIMEOUT)
+    pending_objects[header["request_id"]] = (obj.as_pointer(), time.monotonic() + PENDING_TIMEOUT)
     connection.send(header)
 
 
-def send_object(obj, live=False, replace_topology=False):
+def send_object(obj, live=False, replace_topology=False, geometry_changed=False):
     link_id = ensure_link_id(obj)
     if link_id in force_full_ids:
         force_full_ids.discard(link_id)
     elif (
-        "mesh_instance" in remote_capabilities
+        # an instance carries no vertices: a shared geometry that just changed must travel whole
+        not geometry_changed
+        and "mesh_instance" in remote_capabilities
         and not sends_evaluated(obj)
         and obj.data.get(GEOMETRY_ID) in sent_geometry
         and geometry_sibling(obj) is not None
@@ -1953,16 +2102,52 @@ def send_sculpt_delta(obj):
 
 
 def object_state(obj):
-    matrix = TO_NOMAD @ obj.matrix_world
+    # authored, not evaluated: matrix_world lags pair-applied transforms until the next
+    # depsgraph pass, and a same-tick echo would send identity matrices back to Nomad
+    matrix = TO_NOMAD @ authored_world(obj)
     if obj.type == "MESH":
         matrix = matrix @ TO_BLENDER
+    parent = link_parent(obj)
+    link_id = ensure_link_id(obj)
+    parent_id = ensure_link_id(parent) if parent is not None else ""
+    if not parent_id:
+        # parked: the wire parent has not arrived yet -- report it, not "the root",
+        # else the echo reads as a deliberate move out of that parent
+        parent_id = deferred_parents.get(link_id, "")
     return {
-        "link_id": ensure_link_id(obj),
+        "link_id": link_id,
         "name": obj.name,
         # effective viewport visibility: eye icon + monitor icon + collection state
         "visible": obj.visible_get(),
+        # Nomad's object lock = Blender's selectability lock
+        "locked": obj.hide_select,
+        # "" is the root; child_index is advisory and Blender has no sibling order to report
+        "parent_id": parent_id,
         "world_matrix": matrix_to_columns(matrix),
     }
+
+
+def send_group(obj, live):
+    connection.send({"type": "group", "live_sync": live, **object_state(obj)})
+
+
+def receive_group(header):
+    global undo_pending
+    undo_pending = True
+    link_id = header.get("link_id", "")
+    obj = find_linked_object(link_id)
+    if obj is None:
+        obj = bpy.data.objects.new(header.get("name", "Nomad Group"), None)
+        bpy.context.collection.objects.link(obj)
+        obj.empty_display_type = "PLAIN_AXES"
+        obj[MESH_ID] = link_id
+    if obj.type != "EMPTY":
+        raise ValueError("Linked object is not a group")
+    if header.get("repeat"):
+        # a repeater's group: fully editable (moving it moves the whole array), the
+        # display type only tells it apart from a plain Nomad group
+        obj.empty_display_type = "ARROWS"
+    apply_object_state(obj, header)
 
 
 def send_object_state(obj):
@@ -2034,6 +2219,7 @@ def send_light(obj, live=False):
 
 def send_camera_object(obj, live=False):
     data = obj.data
+    world = authored_world(obj)  # authored: see object_state
     connection.send(
         {
             "type": "camera_object",
@@ -2041,13 +2227,15 @@ def send_camera_object(obj, live=False):
             **object_state(obj),
             "orthographic": data.type == "ORTHO",
             "fov_y": math.degrees(data.angle_y),
-            "pivot": list((TO_NOMAD @ (obj.matrix_world.translation - obj.matrix_world.col[2].xyz * 5.0).to_4d()).to_3d()),
+            "pivot": list((TO_NOMAD @ (world.translation - world.col[2].xyz * 5.0).to_4d()).to_3d()),
         }
     )
 
 
 def send_supported(obj, live=False, replace_topology=False):
-    if obj.type == "MESH":
+    if obj.type == "EMPTY":
+        send_group(obj, live)
+    elif obj.type == "MESH":
         send_object(obj, live=live, replace_topology=replace_topology)
     elif obj.type == "LIGHT":
         send_light(obj, live)
@@ -2056,23 +2244,32 @@ def send_supported(obj, live=False, replace_topology=False):
 
 
 def scope_objects(scene, scope):
-    if scope == "SCENE":
-        return [obj for obj in scene.objects if supported_object(obj)]
-    return [obj for obj in bpy.context.selected_objects if supported_object(obj)]
+    pool = scene.objects if scope == "SCENE" else bpy.context.selected_objects
+    objects = []
+    for obj in pool:
+        if not supported_object(obj):
+            continue
+        if obj.get(REPEAT_TAG):  # a repeat copy stands in for its owner
+            obj = repeat_owner(obj)
+            if obj is None:
+                continue
+        if obj not in objects:
+            objects.append(obj)
+    return objects
 
 
 def send_scope(scene, scope):
     objects = scope_objects(scene, scope)
     if not objects:
         raise RuntimeError(f"No supported {scope.lower()} objects")
-    pending_transfers.extend(objects)
+    pending_transfers.extend(obj.as_pointer() for obj in objects)
 
 
 def replace_scene_objects(scene):
     """Drop every syncable object ahead of a scene pull, sync-invisibly: the membership
     baseline resets so no object_delete is broadcast (mirrors Nomad's replace-get)."""
     global membership_ready
-    doomed = [obj for obj in scene.objects if supported_object(obj) or obj.get(TRANSFORM_PARENT_ID)]
+    doomed = [obj for obj in scene.objects if supported_object(obj)]
     for obj in doomed:
         bpy.data.objects.remove(obj, do_unlink=True)
     known_objects.clear()
@@ -2084,6 +2281,7 @@ def replace_scene_objects(scene):
     stale_objects.clear()
     stale_requested.clear()
     delta_cache.clear()
+    deferred_parents.clear()
     sent_geometry.clear()
     force_full_ids.clear()
 
@@ -2099,7 +2297,10 @@ def apply_object_state(obj, header):
             obj.hide_set(not visible)  # the eye icon is the single viewport switch
         except RuntimeError:
             pass
-        visibility_states[obj.as_pointer()] = obj.visible_get()  # do not echo the applied state
+    if "locked" in header:
+        obj.hide_select = bool(header["locked"])  # Nomad's lock = Blender's selectability lock
+    if "visible" in header or "locked" in header:
+        visibility_states[obj.as_pointer()] = (obj.visible_get(), obj.hide_select)  # do not echo the applied state
     if "world_matrix" in header:
         apply_object_transform(obj, header)
     remember_object(obj)
@@ -2146,7 +2347,6 @@ def receive_texture(header, binary):
         name = Path(str(header.get("name", ""))).name or "nomad_texture.png"
         image = image_from_bytes(name, bytes(binary))
         image["nomad_texture_id"] = texture_id
-        texture_images[texture_id] = image
     for link_id in list(pending_materials):
         obj = find_linked_object(link_id)
         if obj is None or obj.type != "MESH":
@@ -2231,19 +2431,38 @@ def receive_camera_object(header):
 
 
 def receive_delete(header):
+    global undo_pending
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
     if obj is None:
         return
-    pointer = obj.as_pointer()
-    parent = obj.parent if obj.parent and obj.parent.get(TRANSFORM_PARENT_ID) else None
-    bpy.data.objects.remove(obj, do_unlink=True)
-    if parent:
-        bpy.data.objects.remove(parent, do_unlink=True)
-    known_objects.pop(pointer, None)
-    dirty_objects.pop(pointer, None)
-    stale_objects.discard(link_id)
-    stale_requested.pop(link_id, None)
+    undo_pending = True
+    # PROTOCOL §10: a delete takes the subtree. Survivors are re-parented by the messages
+    # ordered before this one, inside the same scene_batch
+    doomed = []
+    stack = [obj]
+    while stack:
+        node = stack.pop()
+        doomed.append(node)
+        stack.extend(node.children)
+
+    # a sculpt or edit session lives on the active object: removing it from under one leaves
+    # that session on freed data, and Blender dies later, somewhere else
+    active = bpy.context.view_layer.objects.active
+    if active is not None and active.mode != "OBJECT" and any(node == active for node in doomed):
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+
+    for node in reversed(doomed):  # children first: a parent never outlives its own removal
+        node_id = node.get(MESH_ID, "")
+        known_objects.pop(node.as_pointer(), None)
+        dirty_objects.pop(node.as_pointer(), None)
+        deferred_parents.pop(node_id, None)
+        stale_objects.discard(node_id)
+        stale_requested.pop(node_id, None)
+        bpy.data.objects.remove(node, do_unlink=True)
 
 
 def version_tuple(version):
@@ -2396,6 +2615,7 @@ def receive_packet(header, binary):
     global session_source
     message_type = header.get("type")
     if message_type == "hello":
+        global membership_ready
         pairing_wait = False
         config_revision = -1
         config_desired = None
@@ -2403,16 +2623,22 @@ def receive_packet(header, binary):
         active_source = "none"
         claim_pending = False
         connection.error = ""
+        # a fresh session starts from a fresh baseline: stale pre-disconnect bookkeeping
+        # must never be relayed as object_delete into the new session
+        known_objects.clear()
+        dirty_objects.clear()
+        membership_ready = False
         remote_capabilities.clear()
         remote_capabilities.update(header.get("capabilities", []))
         session_devices[:] = [str(header.get("client_name") or "Nomad")]
         session_source = ""
         delta_cache.clear()
+        deferred_parents.clear()
         force_full_ids.clear()
         sent_geometry.clear()
         texture_requested.clear()
         pending_materials.clear()
-        sent_textures.clear()  # texture_images stays: ids are immutable, reconnects reuse them
+        sent_textures.clear()  # the image custom-prop ids are immutable, reconnects reuse them
         granted = header.get("pair_token", "")
         if granted and preferences() is not None:
             preferences().pair_token = granted
@@ -2448,20 +2674,19 @@ def receive_packet(header, binary):
         connection.error = "Nomad topology changed; get the selected mesh again to refresh it"
     elif message_type == "mesh_ack":
         pending = pending_objects.pop(header.get("request_id", ""), None)
-        obj = pending[0] if pending else None
+        obj = find_object_by_pointer(pending[0]) if pending else None
         if obj:
-            try:
-                obj[MESH_ID] = header["mesh_id"]
-                remember_object(obj)
-            except ReferenceError:
-                pass
+            obj[MESH_ID] = header["mesh_id"]
+            remember_object(obj)
         connection.error = ""
     elif message_type in {"request_active_mesh", "request_mesh", "request_selection"}:
         target = find_linked_object(header.get("link_id", ""))
+        if target is not None and target.get(REPEAT_TAG):
+            target = repeat_owner(target)  # the copy's geometry lives on its owner
         if target is not None:
             force_full_ids.add(target[MESH_ID])
-            if target not in pending_transfers:
-                pending_transfers.append(target)
+            if target.as_pointer() not in pending_transfers:
+                pending_transfers.append(target.as_pointer())
         else:
             try:
                 send_scope(bpy.context.scene, "SELECTION")
@@ -2472,6 +2697,16 @@ def receive_packet(header, binary):
             send_scope(bpy.context.scene, "SCENE")
         except Exception as exc:
             connection.send({"type": "error", "message": str(exc)})
+    elif message_type == "scene_batch":
+        # applied in array order: that ordering is what keeps a re-parent ahead of the
+        # delete that would otherwise orphan it (PROTOCOL §10)
+        for entry in header.get("messages", []):
+            if isinstance(entry, dict):
+                receive_packet(entry, b"")
+    elif message_type == "group" and live_allowed(
+        header, bpy.context.scene.nomad_link_sync_objects
+    ):
+        receive_group(header)
     elif message_type == "object_state" and live_allowed(
         header, bpy.context.scene.nomad_link_sync_objects
     ):
@@ -2517,11 +2752,19 @@ def channel_type_enabled(scene, object_type):
 
 def poll_membership():
     global known_objects, membership_ready
+    if not membership_ready:
+        purge_legacy_transform_empties()  # before the baseline, so they never sync as groups
     scene = bpy.context.scene
-    objects = {obj.as_pointer(): obj for obj in scene.objects if supported_object(obj)}
-    current = {
-        pointer: (obj.get(MESH_ID, ""), obj.type) for pointer, obj in objects.items()
-    }
+    # wrappers are borrowed: resolved at use, never collected (dead wrapper teardown = GC crash)
+    current = {}
+    changed = []
+    for obj in scene.objects:
+        if not supported_object(obj):
+            continue
+        pointer = obj.as_pointer()
+        current[pointer] = (obj.get(MESH_ID, ""), obj.type)
+        if known_objects.get(pointer) != current[pointer]:
+            changed.append(pointer)
     stale_objects.intersection_update(link_id for link_id, _kind in current.values() if link_id)
     if connection.status != "Connected" or not wants_blender_source(scene):
         known_objects = current
@@ -2533,13 +2776,20 @@ def poll_membership():
         return
     if not sends_live_scene(scene) or stale_objects:
         return
+    linked_known = [p for p, (link_id, _kind) in known_objects.items() if link_id]
+    if len(linked_known) >= 2 and not any(p in current for p in linked_known):
+        # every tracked object vanished at once: a file switch or undo reset, not an
+        # edit -- re-baseline silently, never relay it as deletes of the peer's scene
+        known_objects = current
+        return
 
-    for pointer, obj in objects.items():
-        if pointer in known_objects and known_objects[pointer] == current[pointer]:
+    for pointer in changed:
+        obj = find_object_by_pointer(pointer)  # fresh wrapper, used and dropped here
+        if obj is None or not channel_enabled(scene, obj):
             continue
-        if channel_enabled(scene, obj):
+        if not obj.get(REPEAT_TAG):  # a repeat copy only ever travels Nomad -> here
             send_supported(obj, live=True, replace_topology=obj.type == "MESH")
-            current[pointer] = (ensure_link_id(obj), obj.type)
+        current[pointer] = (ensure_link_id(obj), obj.type)
     for pointer, (link_id, object_type) in known_objects.items():
         if (
             (pointer in current and current[pointer] == (link_id, object_type))
@@ -2563,10 +2813,15 @@ def modal_operator_running():
 
 
 def queue_dirty(obj, flag, delay):
-    pointer = obj.as_pointer()
-    item = dirty_objects.setdefault(
-        pointer, {"object": obj, "flags": set(), "after": 0.0}
-    )
+    if obj.get(REPEAT_TAG):
+        # a repeat copy is Nomad's: its placement never travels back, everything else
+        # belongs to the shared datablock and goes out under its owner
+        if flag == "transform":
+            return
+        obj = repeat_owner(obj)
+        if obj is None:
+            return
+    item = dirty_objects.setdefault(obj.as_pointer(), {"flags": set(), "after": 0.0})
     item["flags"].add(flag)
     item["after"] = max(item["after"], time.monotonic() + delay)
 
@@ -2579,6 +2834,8 @@ def undo_redo_post(scene, _depsgraph=None):
     dirty_objects.clear()
     known_objects.clear()
     visibility_states.clear()
+    pending_objects.clear()
+    pending_transfers.clear()  # a rebuilt datablock can reuse a freed pointer value
     membership_ready = False
 
 
@@ -2598,11 +2855,15 @@ def depsgraph_update(scene, depsgraph):
                 and any(material == source for material in obj.data.materials)
             )
         else:
-            objects = tuple(
+            sharers = tuple(
                 obj
                 for obj in scene.objects
                 if supported_object(obj) and obj.data == source
             )
+            # a sculpted shared datablock is that sharer's stroke, not a geometry pass
+            # on the others; repeat copies defer to their owner (queue_dirty redirects)
+            sculpting = tuple(obj for obj in sharers if obj.mode == "SCULPT")
+            objects = sculpting or tuple(obj for obj in sharers if not obj.get(REPEAT_TAG))
         for obj in objects:
             if not supported_object(obj):
                 continue
@@ -2637,6 +2898,8 @@ def depsgraph_update(scene, depsgraph):
                     queue_dirty(obj, "transform", 0.05)
                 elif isinstance(source, bpy.types.Object) and not geometry and not sculpt:
                     queue_dirty(obj, "transform", 0.1)
+            elif obj.type == "EMPTY":
+                queue_dirty(obj, "transform", 0.1)  # a group only ever moves or re-parents
             elif obj.type == "LIGHT":
                 queue_dirty(obj, "light", 0.1)
             elif obj.type == "CAMERA":
@@ -2662,12 +2925,9 @@ def flush_dirty():
     for pointer, item in tuple(dirty_objects.items()):
         if now < item["after"]:
             continue
-        obj = item["object"]
-        try:
-            if obj.name not in scene.objects or not supported_object(obj):
-                dirty_objects.pop(pointer, None)
-                continue
-        except ReferenceError:
+        # borrowed wrapper, resolved at use: never pinned across the sends below
+        obj = next((o for o in scene.objects if o.as_pointer() == pointer), None)
+        if obj is None or not supported_object(obj):
             dirty_objects.pop(pointer, None)
             continue
         flags = item["flags"]
@@ -2686,12 +2946,14 @@ def flush_dirty():
             sent_full = False
             if geometry_flags and scene.nomad_link_sync_objects:
                 if geometry_flags != {"sculpt"} or not send_sculpt_delta(obj):
-                    send_object(obj, live=True, replace_topology=True)
+                    send_object(obj, live=True, replace_topology=True, geometry_changed=True)
                     sent_full = True
             elif "transform" in flags and scene.nomad_link_sync_objects:
                 send_object_state(obj)
             if "material" in flags and scene.nomad_link_sync_materials and not sent_full:
                 send_material(obj)
+        elif obj.type == "EMPTY" and "transform" in flags and scene.nomad_link_sync_objects:
+            send_group(obj, True)
         elif "light" in flags and scene.nomad_link_sync_lights:
             send_light(obj, True)
         elif "camera" in flags and scene.nomad_link_sync_cameras:
@@ -2701,11 +2963,9 @@ def flush_dirty():
 def flush_transfers():
     if not pending_transfers or pending_objects or not connection.outgoing.empty():
         return
-    obj = pending_transfers.pop(0)
-    try:
+    obj = find_object_by_pointer(pending_transfers.pop(0))
+    if obj is not None:
         send_supported(obj, replace_topology=obj.type == "MESH")
-    except ReferenceError:
-        pass
 
 
 def poll_stale_recovery(scene):
@@ -2731,10 +2991,10 @@ visibility_states = {}
 
 
 def poll_visibility(scene):
-    """Queue state sends when effective visibility changes.
+    """Queue state sends when effective visibility or the selectability lock changes.
 
-    Toggling the eye icon (or a collection) does not tag the object in the
-    depsgraph, so visibility changes need their own sweep over linked objects.
+    Toggling the eye icon (or a collection, or the cursor icon) does not tag the
+    object in the depsgraph, so these changes need their own sweep over linked objects.
     """
     global visibility_states
     seen = {}
@@ -2742,10 +3002,10 @@ def poll_visibility(scene):
         if not obj.get(MESH_ID) or not supported_object(obj):
             continue
         pointer = obj.as_pointer()
-        visible = obj.visible_get()
-        seen[pointer] = visible
+        state = (obj.visible_get(), obj.hide_select)
+        seen[pointer] = state
         previous = visibility_states.get(pointer)
-        if previous is not None and previous != visible:
+        if previous is not None and previous != state:
             flag = {"LIGHT": "light", "CAMERA": "camera"}.get(obj.type, "transform")
             queue_dirty(obj, flag, 0.1)
     visibility_states = seen
@@ -2757,6 +3017,17 @@ def poll():
             bpy.ops.nomad.activity_watch("INVOKE_DEFAULT")
         except RuntimeError:
             pass  # no window yet: retried next poll
+    # applying a packet rebuilds obj.data and can flip object mode: under a running brush stroke
+    # that leaves the sculpt session on freed data and Blender dies on stroke end. Leave them
+    # queued, the same gate Nomad puts on its own receive
+    if modal_operator_running():
+        # the outgoing view only reads the view matrix: orbiting keeps streaming mid-gesture
+        try:
+            if connection.status == "Connected":
+                send_camera()
+        except Exception as exc:
+            connection.error = str(exc)
+        return 1.0 / 60.0
     latest_camera = None
     for header, binary in connection.poll():
         try:
@@ -2766,9 +3037,17 @@ def poll():
                 receive_packet(header, binary)
         except Exception as exc:
             connection.error = str(exc)
+    global undo_pending
     try:
+        if deferred_parents:
+            resolve_deferred_parents()  # a parent that arrived later in this drain
         if latest_camera is not None:
             receive_camera(latest_camera)
+        if undo_pending:
+            # received edits must be a real undo step: undoing across untracked data
+            # mutations frees live IDs and the depsgraph rebuild dies on them
+            undo_pending = False
+            bpy.ops.ed.undo_push(message="Nomad Link")
         if connection.status == "Connected":
             flush_transfers()
             poll_membership()
@@ -2886,11 +3165,12 @@ def reset_link_state():
     pending_objects.clear()
     pending_transfers.clear()
     delta_cache.clear()
+    deferred_parents.clear()
     remote_capabilities.clear()
     session_devices.clear()
     texture_requested.clear()
     pending_materials.clear()
-    sent_textures.clear()  # texture_images stays: ids are immutable, reconnects reuse them
+    sent_textures.clear()  # the image custom-prop ids are immutable, reconnects reuse them
     session_source = ""
     config_revision = -1
     config_desired = None
@@ -3030,7 +3310,7 @@ class NOMAD_PT_link(bpy.types.Panel):
             ]
             status += " — " + ", ".join(names)
         layout.label(text=f"Status: {status}")
-        layout.label(text=f"Extension: {VERSION}")
+        layout.label(text=f"Extension: {VERSION} · {BUILD}" if DEV else f"Extension: {VERSION}")
         if connection.error:
             layout.label(text=connection.error, icon="ERROR")
         if update_required:
@@ -3127,6 +3407,7 @@ classes = (
 
 
 def register():
+    print(f"Nomad Blender Link {VERSION} · build {BUILD}", flush=True)
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.nomad_link_camera_target = bpy.props.EnumProperty(

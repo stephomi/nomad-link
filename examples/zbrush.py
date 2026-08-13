@@ -200,6 +200,65 @@ class GoZ:
             print(f"could not run ZBrush ({exc})")
             return False
 
+    def import_script(self, names):
+        """ZScript landing every pushed mesh as a subtool of one tool (ZBrush's own
+        multi-file GoZ import scatters a push across tools). Subtool titles are read
+        once into subs: SubToolSelect repaints, a per-mesh rescan is quadratic."""
+        prefix = "!:" if sys.platform == "darwin" else ""  # zscript mac path prefix
+        script = [
+            '[VarDef,sub,""]', '[VarDef,subs(2048),""]', "[VarDef,found,0]",
+            "[VarDef,i,0]", "[VarDef,n,0]", "[VarDef,drawn,0]", "[VarDef,last,1]",
+            "[VarSet,n,[SubToolGetCount]]",
+            "[If,n>2048,", "[VarSet,n,2048]", "]",
+            "[If,[ToolGetSubToolID]==0,", "[VarSet,n,0]", "]",  # no polymesh active
+            "[VarSet,i,0]", "[Loop,n,", "[SubToolSelect,[Val,i]]",
+            '[VarSet,sub,[IGetTitle,"Tool:ItemInfo"]]',
+            "[VarSet,sub,[StrExtract,sub,0,[StrLength,sub]-2]]",  # trailing dot
+            "[VarSet,subs(i),sub]", "[VarInc,i]", "]",
+        ]
+        for name in names:
+            imp = [f'[FileNameSetNext,"{prefix}{self.project / name}.GoZ"]',
+                   "[IPress,Tool:Import]"]
+            script += [
+                # found = the index of the subtool named like the mesh, or -1
+                "[VarSet,found,-1]", "[VarSet,i,0]", "[Loop,n,",
+                f'[If,([StrFind,subs(i),"{name}"]==0)&&([StrLength,subs(i)]=={len(name)}),',
+                "[VarSet,found,[Val,i]]", "[LoopExit]", "]", "[VarInc,i]", "]",
+                # known name: update the subtool in place
+                "[If,found>-1,", "[SubToolSelect,[Val,found]]", *imp, "[VarSet,last,0]",
+                # no polymesh active (fresh ZBrush): the import becomes the tool
+                ",", "[If,[ToolGetSubToolID]==0,", *imp,
+                "[CanvasClick,10,10,10,20]", "[IPress,Transform: Edit]", "[VarSet,drawn,1]",
+                # append at the end so the scanned indices stay valid
+                ",", "[If,last==0,", "[VarSet,i,[SubToolGetCount]-1]",
+                "[SubToolSelect,[Val,i]]", "]",
+                '[VarSet,sub,[IGetTitle,"Tool:ItemInfo"]]',
+                '[If,[StrFind,"PolyMesh3D",sub]!=-1,',
+                "[IPress,Tool:SubTool:Insert]", "[IPress,PopUp:Cube3D]",
+                ",", "[IPress,Tool:SubTool:Insert]", "[IPress,PopUp:PolyMesh3D]", "]",
+                *imp, "[VarSet,last,1]", "]", "]",
+            ]
+        script += ["[If,drawn==1,", "[IPress,Transform: Fit]", "]"]  # frame a fresh tool
+        return "\n".join(script) + "\n"
+
+    def trigger_import(self, zbrush, names):
+        """Drive the import with a zscript so the push stays one tool; ZBrush's own
+        importer (poke_zbrush) groups multi-mesh pushes unpredictably."""
+        if zbrush is None:
+            return False
+        script = self.root / "GoZApps" / "Nomad" / "nomad_send.txt"
+        try:
+            script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_text(self.import_script(names))
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", str(zbrush), str(script)])
+            else:
+                subprocess.Popen([str(zbrush), str(script)])
+            return True
+        except OSError as exc:
+            print(f"could not run ZBrush ({exc})")
+            return False
+
     def paths_from_list(self):
         try:
             lines = self.object_list.read_text().splitlines()
@@ -536,7 +595,8 @@ class Bridge:
         self.goz.register()
         tools = self.goz.push(meshes)
         print(f"pushed to ZBrush: {', '.join(repr(Path(t).name) for t in tools)}")
-        self.goz.poke_zbrush()
+        if not self.goz.trigger_import(self.zbrush, [name for name, _ in meshes]):
+            self.goz.poke_zbrush()  # no ZBrush application: native import
 
     def handle_nomad(self, header, binary):
         kind = header.get("type")
