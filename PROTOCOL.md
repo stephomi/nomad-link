@@ -85,6 +85,9 @@ A bridge can use either method or accept an address from the user.
 - **Ids**: `mesh_id` / `link_id` / `geometry_id` are opaque strings chosen by whichever
   side names the entity first. UUIDs are recommended. Keep them for the life of the
   link.
+- **Enums**: enumerated keys travel as strings, never integers. Every accepted value
+  is listed with its key in this document. An unknown value leaves the receiver's
+  field unchanged.
 
 ## 4. Handshake and pairing
 
@@ -146,6 +149,7 @@ Both sides send capabilities. Use only capabilities advertised by the peer.
 | `ngon` | peer accepts `face_format: "corners"` (§7.1.1); without it, split n-gons before sending |
 | `shading_config` / `postprocess_config` | peer applies those display settings (§10.1); Nomad only sends them to peers advertising them |
 | `texture` | peer caches texture blobs by immutable id (§10.2); Nomad only sends blobs to peers advertising this |
+| `asset` | peer caches matcap/environment blobs by content id (§10.3); Nomad only sends blobs to peers advertising this |
 
 A minimal viewer needs only `hello`, `mesh_full`, and `object_state`.
 
@@ -217,7 +221,7 @@ Complete mesh state in one frame.
     "name": "Cube",                       // ⭐
     "vertex_count": 8,                    // ⭐
     "face_count": 6,                      // ⭐
-    "binary_size": 620,                   // ⭐ must equal the binary payload size
+    "binary_size": 802,                   // ⭐ must equal the binary payload size
     "coordinate_system": "nomad_y_up",    // ⭐
     "world_matrix": [ /* 16 floats */ ],  // ⭐ column-major (+ skew split, §3)
     "parent_id": "1b7e…",                 // hierarchy (§3); travels with child_index and
@@ -251,21 +255,21 @@ Complete mesh state in one frame.
     "metalness_offset": 448,              // per vertex, 8 × 1 B
     "metalness_format": "uint8_norm",
 
-    "base_color_offset": 620,             // un-composited base paint, present only when
+    "base_color_offset": 456,             // un-composited base paint, present only when
     "base_color_format": "rgbm8",         //   the mesh has layers (else base = the
-    "base_opacity_offset": 652,           //   composited channels above). Same four
-    "base_roughness_offset": 660,         //   channels and formats, "base_" prefixed.
-    "base_metalness_offset": 668,         //   Layer-aware peers apply these + the layer
+    "base_opacity_offset": 488,           //   composited channels above). Same four
+    "base_roughness_offset": 496,         //   channels and formats, "base_" prefixed.
+    "base_metalness_offset": 504,         //   Layer-aware peers apply these + the layer
                                           //   paint below; others read the composited set
 
-    "mask_offset": 456,                   // sculpt mask, 1 = unmasked, 8 × 2 B
+    "mask_offset": 512,                   // sculpt mask, 1 = unmasked, 8 × 2 B
     "mask_format": "uint16_norm",         //   optional working state, absent = none
-    "density_offset": 472,                // dyntopo density paint, 8 × 1 B
+    "density_offset": 528,                // dyntopo density paint, 8 × 1 B
     "density_format": "uint8_norm",       //   optional working state, absent = none
 
-    "face_group_offset": 480,             // per face, index into face_groups,
+    "face_group_offset": 536,             // per face, index into face_groups,
     "face_group_format": "uint16",        // 6 × 2 B, id ≤ 32767
-    "face_hidden_offset": 492,            // per face, 0 visible / 1 hidden,
+    "face_hidden_offset": 548,            // per face, 0 visible / 1 hidden,
     "face_hidden_format": "uint8",        // 6 × 1 B, absent = all visible
     "face_groups": [
         { "name": "Group 1", "color": [0.8, 0.2, 0.2] }
@@ -286,18 +290,18 @@ Complete mesh state in one frame.
             "visible_roughness": true,
             "visible_metalness": true,
             "visible_opacity": true,
-            "blend_color": 0,             // LayerHelper::BlendMode; a negative
-            "blend_roughness": 0,         //   per-channel mode follows blend_color
-            "blend_metalness": 0,
-            "blend_opacity": 0,
-            "offset": 492,                // count sparse records of (uint32 vertex
+            "blend_color": "normal",      // paint blend modes, the list below;
+            "blend_roughness": "auto",    //   "auto" (per-channel modes only) =
+            "blend_metalness": "auto",    //   follow blend_color
+            "blend_opacity": "auto",
+            "offset": 554,                // count sparse records of (uint32 vertex
             "count": 8,                   // index, float32x3 offset), 8 × 16 B;
             "format": "uint32_float32x3", // final position = base + Σ weight·offset
 
-            "color_offset": 676,          // per-layer paint, sparse records of (uint32
+            "color_offset": 682,          // per-layer paint, sparse records of (uint32
             "color_count": 8,             //   index, rgbm8 value, uint8 alpha), 8 × 9 B;
             "color_format": "uint32_rgbm8_alpha8", // absent = unpainted channel
-            "roughness_offset": 748,      // gray records (uint32 index, uint8 value,
+            "roughness_offset": 754,      // gray records (uint32 index, uint8 value,
             "roughness_count": 8,         //   uint8 alpha), 8 × 6 B; metalness and
             "roughness_format": "uint32_uint8_alpha8" // opacity travel likewise
         }
@@ -308,6 +312,14 @@ Complete mesh state in one frame.
     "material": { /* §10 */ }
 }
 ```
+
+`blend_*` values (Photoshop-style): `normal`, `darken`, `multiply`, `color_burn`,
+`linear_burn`, `darker_color`, `lighten`, `screen`, `color_dodge`, `linear_dodge`,
+`lighter_color`, `overlay`, `soft_light`, `hard_light`, `vivid_light`, `linear_light`,
+`pin_light`, `hard_mix`, `difference`, `exclusion`, `subtract`, `divide`, `hue`,
+`saturation`, `color`, `luminosity` — plus `auto` on the per-channel modes
+(`blend_roughness` / `blend_metalness` / `blend_opacity`) = follow `blend_color`.
+`postprocess_curvature_*_blend` (§10.1) uses the same list.
 
 Reply with `{"type": "mesh_ack", "mesh_id": ..., "request_id": ...}`. The sender uses
 the returned `mesh_id` as the object's link id.
@@ -345,7 +357,7 @@ and becomes one undo step on the receiver.
     "mesh_id": "6f9c…",
     "count": 3,                       // touched vertices
     "vertex_count": 8,                // topology guard, rejected on mismatch
-    "binary_size": 60,
+    "binary_size": 72,
     "live_sync": true,
     "world_matrix": [ /* … */ ],      // Nomad → client only
 
@@ -353,26 +365,26 @@ and becomes one undo step on the receiver.
     "index_format": "uint32",
     "position_offset": 12,            // absolute node-local positions, 3 × 12 B
     "position_format": "float32x3",
-    "color_offset": 48,               // 3 × 4 B; every §7.1 per-vertex channel may
-    "color_format": "rgbm8",          // travel likewise — all channels optional;
-                                      // paint sections carry the COMPOSITED values
+    "color_offset": 48,               // 3 × 4 B; every §7.1 per-vertex channel
+    "color_format": "rgbm8",          //   (opacity, roughness, metalness, mask,
+                                      //   density) may travel likewise — all optional;
+                                      //   paint sections carry the COMPOSITED values
 
-    "base_color_offset": 60,          // the exact payload from a layered Nomad: the
-                                      // un-composited base values for the same indices
-                                      // ("base_" + channel, §7.1 formats). A layer-aware
-                                      // receiver applies these and skips the composited set
-    "layer_index": 0,                 // stroke on a layer: user-order index, plus the
-    "layer_color_offset": 64,         //   touched channels as "layer_" + channel value
-    "layer_color_alpha_offset": 76    //   sections and their uint8_norm alpha sections
+    "base_color_offset": 60           // 3 × 4 B; base stroke on a layered mesh: the
+                                      //   un-composited base values for the same indices
+                                      //   ("base_" + channel, §7.1 formats). A layer-aware
+                                      //   receiver applies these and skips the composited set
 }
 ```
 
 Send deltas only when both sides have identical topology. Otherwise send `mesh_full`.
 Nomad rejects deltas for procedural primitives (`error`; §9).
 
-For meshes with sculpt layers, base strokes use `base_*`; layer strokes use
-`layer_index` and `layer_*`. Clients without layer support use the plain composite
-paint sections.
+For meshes with sculpt layers, base strokes use `base_*` as above; strokes on a layer
+send `layer_index` (user-order index) instead, plus each touched channel as a
+`layer_<channel>_offset` value section and its `layer_<channel>_alpha_offset`
+`uint8_norm` section, both over the same indices (never `base_*` and `layer_*`
+together). Clients without layer support use the plain composited paint sections.
 
 ### 7.3 `mesh_attributes`
 
@@ -444,6 +456,10 @@ Instances share geometry, not hierarchy. There is no instanced subtree: a peer t
 instances a whole branch sends every copy as its own nodes.
 
 ## 9. Recovery
+
+```json
+{ "type": "error", "message": "...", "request_id": "<echoed when the failed request carried one>" }
+```
 
 - After any `error`, clear delta and known-instance caches. Send `mesh_full` next.
 - A `mesh_full` naming an unknown `mesh_id` the receiver once issued, with a known
@@ -580,8 +596,10 @@ a re-parent must land before the delete that orphans it.
                 "projection": "uv",           // auto | uv | triplanar
                 "wrap_s": "repeat",           // repeat | clamp | mirror
                 "wrap_t": "repeat",
-                "min_filter": "auto",         // auto | linear | nearest | linear_mipmap_linear | …
-                "mag_filter": "auto",
+                "min_filter": "auto",         // auto | linear | nearest
+                                              // | linear_mipmap_linear | linear_mipmap_nearest
+                                              // | nearest_mipmap_linear | nearest_mipmap_nearest
+                "mag_filter": "auto",         // same values
                 "offset": [0.0, 0.0],         // uv transform
                 "scale": [1.0, 1.0],
                 "rotation": 0.0,              // radians
@@ -615,12 +633,12 @@ supported. `mesh_full` also has top-level `smooth_shading`.
 {
     "type": "light",
     // …object_state fields (link_id, name, visible, world_matrix, live_sync)…
-    "light_type": "POINT",     // POINT | SUN | SPOT | AREA | ENVIRONMENT
+    "light_type": "POINT",     // POINT | SUN | SPOT | ENVIRONMENT
     "color": [1.0, 1.0, 1.0],  // linear RGB
     "use_kelvin": false,       // true: kelvin replaces color outright (no tint on top)
     "kelvin": 6500,
     "intensity": 1.0,          // SUN strength (normalized)
-    "power": 1.0,              // POINT/SPOT/AREA strength (world space)
+    "power": 1.0,              // POINT/SPOT strength (world space)
     "factor": 1.0,             // ENVIRONMENT multiplier
     "spot_angle": 0.785,       // radians [0, π], full outer cone angle
     "spot_softness": 0.5,      // [0, 1] blend: inner = (1 - softness) × outer
@@ -671,17 +689,141 @@ Display settings, one message type per kind. Both peers must advertise the match
 capability. Live messages also require the matching channel (`sync_shading`,
 `sync_postprocess`).
 
-```json
-{"type": "shading_config", "live_sync": true, "shading": { ... }}
-{"type": "postprocess_config", "live_sync": true, "postprocess": { ... }}
+Other applications map supported settings and ignore the rest. A scene transfer also
+sends one of each with `"live_sync": false`. Apply them even when the channel is off.
+
+```jsonc
+{
+    "type": "shading_config",
+    "live_sync": true,
+    "shading": {
+        "shader_type": "matcap",         // matcap | pbr | unlit
+                                         // | id_object | id_material | id_instance
+        "matcap_name": "clay_general",   // library name
+        "matcap_id": "9c2e…",            // only for a user file: blob content id (§10.3)
+        "matcap_lock": true,             // rotation locked (slider disabled)
+        "matcap_rotation": 0.0,          // radians [0, 2π]
+        "environment_name": "studio",    // library name
+        "environment_id": "1f0c…",       // only for a user file: blob content id (§10.3)
+        "environment_rotation": 0.0,     // degrees [0, 360); absent = the image's default
+        "environment_exposure": 1.0,     // absent = the image's default
+        "environment_attached_to_camera": false,
+        "environment_enable": true,      // environment lighting on
+        "show_textures": true,
+        "show_painting": true,           // vertex paint
+        "show_face_group": false,        // face-group colors overlay
+        "show_masking": true,            // sculpt-mask tint
+        "show_discard": true,            // cut the faces flagged hidden (§7.1)
+        "background_blur": 0.4,          // [0, 1], environment background
+        "lights_enable": true            // scene lights on
+    }
+}
 ```
 
-`shading` holds `shader_type`, `matcap_*`, `environment_*`, `show_*`,
-`background_blur`, `lights_enable`; `postprocess` holds `postprocess_*`. Other
-applications may map only supported settings.
+`matcap_name` / `environment_name` resolve against the peer's library. The `_id`
+twins travel only when the image is a user file, so the peer can tell whether it
+already has those pixels (§10.3); a built-in carries no id and resolves by name alone.
 
-A scene transfer also sends one of each with `"live_sync": false`. Apply them even
-when the channel is off.
+```jsonc
+{
+    "type": "postprocess_config",
+    "live_sync": true,
+    "postprocess": {
+        "postprocess_enable": true,      // master toggle
+
+        "postprocess_ssr_enable": false,           // screen-space reflections
+
+        "postprocess_ssgi_enable": false,          // screen-space global illumination
+        "postprocess_ssgi_factor": 0.5,
+
+        "postprocess_ssao_enable": false,          // ambient occlusion
+        "postprocess_ssao_radius": -1.0,           // < 0 = auto
+        "postprocess_ssao_factor": 2.0,
+        "postprocess_ssao_thickness": 0.25,
+        "postprocess_ssao_color": [0.0, 0.0, 0.0], // linear RGB
+
+        "postprocess_dof_enable": false,           // depth of field
+        "postprocess_dof_blur_near": 0.5,
+        "postprocess_dof_blur_far": 0.5,
+
+        "postprocess_sharpness_enable": false,
+        "postprocess_sharpness_factor": 0.5,
+
+        "postprocess_chromatic_enable": false,     // chromatic aberration
+        "postprocess_chromatic_factor": 0.5,
+
+        "postprocess_vignette_enable": false,
+        "postprocess_vignette_size": 0.5,
+        "postprocess_vignette_hardness": 0.5,
+
+        "postprocess_bloom_enable": false,
+        "postprocess_bloom_intensity": 1.0,
+        "postprocess_bloom_radius": 0.6,
+        "postprocess_bloom_threshold": 0.25,
+        "postprocess_bloom_color": [1.0, 1.0, 1.0], // linear RGB
+
+        "postprocess_grain_enable": false,          // film grain
+        "postprocess_grain_factor": 0.25,
+
+        "postprocess_tone_enable": false,
+        "postprocess_tone_exposure": 1.0,
+        "postprocess_tone_saturation": 1.0,
+        "postprocess_tone_contrast": 0.0,
+        "postprocess_tone_mapping": "agx",          // none | kajiya | agx | khronos
+                                                    // | aces | aces_original | aces_knarko
+                                                    // | filmic | generic | hejl | lottes
+                                                    // | oklab | reinhard | uchimura | unreal
+
+        "postprocess_curvature_enable": false,      // bump/cavity shading
+        "postprocess_curvature_factor": 1.0,
+        "postprocess_curvature_bump": [1.0, 1.0, 1.0, 1.0],   // linear RGB + alpha
+        "postprocess_curvature_cavity": [0.0, 0.0, 0.0, 1.0], // linear RGB + alpha
+        "postprocess_curvature_thickness": 1.0,
+        "postprocess_curvature_bump_blend": "normal",  // §7.1 blend modes, "auto" included
+        "postprocess_curvature_cavity_blend": "auto",
+
+        "postprocess_pixel_art_enable": false,
+        "postprocess_pixel_art_ratio": 5,           // integer pixel size
+        "postprocess_pixel_art_allow_accumulate": false,
+
+        "postprocess_scanline_enable": false,
+        "postprocess_scanline_factor": 1.0,
+        "postprocess_scanline_spacing": 1.0,
+
+        "postprocess_curve_enable": false,          // color curves
+        "postprocess_curve_red": { /* easing, below */ },
+        "postprocess_curve_green": { /* easing */ },
+        "postprocess_curve_blue": { /* easing */ },
+        "postprocess_curve_luminance": { /* easing */ }
+    }
+}
+```
+
+Each `postprocess_curve_*` is an easing object:
+
+```jsonc
+{
+    "preset": "linear",              // used while "curve" is empty ("type": "none"):
+                                     // one | linear | smoothstep | smootherstep
+                                     // | smoothstep_invert | smootherstep_invert
+                                     // | in_power | in_power_2 | in_power_3 | in_power_4
+                                     // | in_power_5 | in_circle | in_power_invert
+                                     // | out_power | out_power_2 | out_power_3
+                                     // | out_power_4 | out_power_5 | out_circle
+                                     // | out_power_invert | in_out_power | in_out_power_2
+                                     // | in_out_power_3 | in_out_power_4 | in_out_power_5
+                                     // | in_out_circle | out_in_circle | out_in_power
+                                     // | one_over_x
+    "power": 2.0,                    // exponent of the *_power presets
+    "shift": 0.0,                    // [-1, 1] input bias
+    "curve": {                       // custom curve, overrides the preset when set
+        "type": "catmull-rom",       // none | catmull-rom | spline
+        "points": [[0.0, 0.0], [1.0, 1.0]], // [x, y] control points in [0, 1]²
+        "sharps": [0, 0],            // per point, 1 = corner
+        "closed": false              // other keys are Nomad UI state, ignore them
+    }
+}
+```
 
 ### 10.2 Textures (`texture`, `request_texture`)
 
@@ -706,6 +848,33 @@ same bytes. Cache blobs for the session and do not request an id already cached.
 - Texture blobs are not live edits. They are not gated by `live_sync`; ignore
   duplicates and relay them to viewers.
 - Treat `name` as untrusted display data (basename only), never as a path.
+
+### 10.3 Assets (`asset`, `request_asset`)
+
+Matcap and environment images referenced by `shading_config` (§10.1). The id is a hash of
+the file bytes, so the same image on both devices never travels.
+
+```jsonc
+{
+    "type": "asset",
+    "collection": "environments", // matcaps | environments
+    "asset_id": "1f0c…",
+    "name": "hdri/studio.hdr",    // sender's library name, display/file-name sugar
+    "binary_size": 4194304        // binary payload = the image file bytes as-is, no
+                                  // re-encode (Nomad sends Radiance .hdr environments)
+}
+```
+
+- **Sender**: send the blob before the `shading_config` that names it. Do not send it
+  again. Do not send blobs to peers without the `asset` capability.
+- **Receiver**: for an unknown id, ignore the name (a local file of the same name is not
+  the same image), keep the current asset and send
+  `{"type": "request_asset", "collection": "…", "asset_id": "…"}`. Apply the config once
+  the blob arrives. Reply with `error` if an id cannot be provided.
+- Asset blobs are not live edits. They are not gated by `live_sync`; ignore duplicates and
+  relay them to viewers.
+- Treat `name` as untrusted display data (basename only), never as a path.
+- Nomad keeps a received image for the session only, and embeds it into a saved project.
 
 ## 11. Versioning
 
