@@ -2,6 +2,15 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.39
+
+- Toolbag: color and emissive maps are read as sRGB, every other channel as raw data. The
+  color space is set on the texture, not on the slot, so a map never speaks for the vertex
+  colors sharing that slot.
+- Toolbag: per-channel texture factors, displacement maps, normal-map Y flip, and
+  subsurface color. Clearing a channel removes its map instead of leaving the old one.
+- No protocol change.
+
 ## 0.11.38
 
 - Marmoset Toolbag plugin (`toolbag`, `nomad-link-toolbag.zip`): receives the scene to
