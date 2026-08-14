@@ -245,8 +245,11 @@ class Client:
 
     def _store(self, mesh):
         mesh_id = mesh["mesh_id"]
-        if mesh_id not in self.meshes:
+        previous = self.meshes.get(mesh_id)
+        if previous is None:
             self.order.append(mesh_id)
+        if "visible" not in mesh:  # absent = leave as-is, a new object is visible
+            mesh["visible"] = previous.get("visible", True) if previous else True
         self.meshes[mesh_id] = mesh
         self._requested.discard(mesh_id)
         self._touch()
@@ -261,9 +264,11 @@ class Client:
             self._recover(header.get("mesh_id", ""))
             return
         mesh = dict(source)
+        mesh.pop("visible", None)  # the shared geometry's flag is not this instance's
         mesh["mesh_id"] = header.get("mesh_id", "")
         mesh["name"] = header.get("name", source["name"])
-        mesh["visible"] = bool(header.get("visible", True))
+        if "visible" in header:
+            mesh["visible"] = bool(header["visible"])
         mesh["world_matrix"] = list(header.get("world_matrix", convert.IDENTITY))
         self._store(mesh)
 

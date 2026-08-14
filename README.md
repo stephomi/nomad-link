@@ -16,6 +16,7 @@ Version **0.11.37**, protocol **1**.
 - `examples/zbrush.py` — desktop ZBrush through GoZ (run it on the ZBrush computer)
 - `examples/cozyblanket.py` — CozyBlanket retopology round trip
 - `houdini` — Houdini digital assets: a Nomad Link In SOP and a Nomad Link Out SOP
+- `toolbag` — Marmoset Toolbag plugin: receives the scene to render and bake
 - `blender/nomad_blender_link` — the Blender extension, and the complete reference
   client: it implements every part of the specification
 - `blender/repository` — the published extension repository (`index.json` + archive)
@@ -40,6 +41,13 @@ and unzip it into your home folder. The assets are prebuilt: copy the enclosed
 `packages/nomad_link.json` into your Houdini packages folder
 (`$HOUDINI_USER_PREF_DIR/packages`) and **Nomad Link In** / **Nomad Link Out** appear in
 the SOP tab menu. See `houdini/README.md`.
+
+## Marmoset Toolbag plugin
+
+Download **[nomad-link-toolbag.zip](https://github.com/stephomi/nomad-link/releases/latest/download/nomad-link-toolbag.zip)**,
+unzip it, and copy the enclosed `NomadLink` folder into Toolbag's user plugin folder
+(**Edit → Plugins → Show User Plugin Folder**). Refresh the plugin menu and run
+**NomadLink**. See `toolbag/README.md`.
 
 ## Blender extension
 

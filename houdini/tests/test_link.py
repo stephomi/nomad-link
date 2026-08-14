@@ -91,6 +91,16 @@ check(wait(lambda: any(h.get("type") == "request_mesh" for h, _ in nomad.receive
 
 nomad.send({"type": "object_state", "link_id": "cube1", "name": "Renamed", "visible": True})
 check(wait(lambda: link.meshes["cube1"]["name"] == "Renamed"), "object_state renames")
+nomad.send({"type": "object_state", "link_id": "cube1", "visible": False})
+check(wait(lambda: link.meshes["cube1"]["visible"] is False), "object_state hides the mesh")
+nomad.send(*cube_mesh_full())  # no "visible" in the header: leave the flag as-is
+check(wait(lambda: link.meshes["cube1"]["name"] == "Nomad Cube"), "the mesh_full re-lands")
+check(link.meshes["cube1"]["visible"] is False, "a mesh_full without visible keeps it hidden")
+header, binary = cube_mesh_full()
+header["visible"] = True
+nomad.send(header, binary)
+check(wait(lambda: link.meshes["cube1"]["visible"] is True), "mesh_full visible is applied")
+
 nomad.send({"type": "object_delete", "link_id": "cube2"})
 check(wait(lambda: "cube2" not in link.meshes), "object_delete removes the mesh")
 

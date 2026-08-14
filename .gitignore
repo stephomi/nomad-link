@@ -2,5 +2,10 @@
 __pycache__/
 nomad-link-bridges.zip
 nomad-link-houdini.zip
+nomad-link-toolbag.zip
 houdini/otls/backup/
 houdini/tests/.test_tokens.json
+toolbag/NomadLink/vendor/
+toolbag/NomadLink/nomad_probe_report.txt
+toolbag/NomadLink/nomad_probe_uv.png
+toolbag/NomadLink/nomad_link_last.txt

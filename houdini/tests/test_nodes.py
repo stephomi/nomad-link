@@ -43,6 +43,7 @@ def seed_cache():
         point_attribs={"color": numpy.tile([0.2, 0.4, 0.6], (5, 1)),
                        "mask": numpy.linspace(0, 1, 5)},
         face_group=numpy.array([0, 1], "i4"), face_group_names=("Head", "Body"),
+        face_hidden=numpy.array([0, 1], "i4"),
         world_matrix=[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 10, 0, 1],  # +10 in Y
         ngon=True,
     )
@@ -80,6 +81,7 @@ def test_cook_in():
           "mask imported")
     check(geo.values[(hou.attribType.Prim, "name")] == ["Sculpt", "Sculpt"], "prim name attribute")
     check(list(geo.values[(hou.attribType.Prim, "nomad_face_group")]) == [0, 1], "face groups")
+    check(list(geo.values[(hou.attribType.Prim, "nomad_face_hidden")]) == [0, 1], "hidden faces")
     check(geo.globals["nomad_mesh_ids"] == "m1", "mesh ids on the detail")
 
 

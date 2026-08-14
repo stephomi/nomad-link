@@ -20,7 +20,7 @@ TCP. Each packet is one frame:
 | n | JSON object, UTF-8 |
 | m | binary payload (may be empty) |
 
-Limits: JSON ≤ 1 MiB; binary ≤ 1 GiB. Disconnect on larger frames.
+Limits: JSON ≤ 50 MiB, disconnect on larger. Binary is bounded by its uint32 size field.
 
 JSON payloads are objects with a `"type"` string. Ignore unknown types and fields.
 Offsets are byte offsets into the binary payload. When binary data is present,
@@ -412,8 +412,12 @@ The receiver must advertise `mesh_attributes_receive`. Match `layers` by index.
 }
 ```
 
-Paint arrays contain the sender's composite. A receiver with sculpt layers applies
-only the `layers` settings and recomposites locally.
+Paint arrays contain the sender's composite. A receiver with sculpt layers never writes
+them into its base (that would double the layer paint): it applies the `layers` settings,
+recomposites locally, and treats the vertices whose values differ from that composite as a
+brush stroke on its active target — base, or the active layer at full alpha. The same rule
+covers the composited sections of `mesh_full` and `mesh_delta`, so a client without layer
+support can paint on a layered mesh, one quantization step of slack aside.
 
 ## 8. Instances (`mesh_instance`)
 
@@ -724,6 +728,10 @@ sends one of each with `"live_sync": false`. Apply them even when the channel is
 twins travel only when the image is a user file, so the peer can tell whether it
 already has those pixels (§10.3); a built-in carries no id and resolves by name alone.
 
+Environment images are equirectangular. Nomad samples one in its Y-up world with the image
+centre at **-Z**, `u` increasing toward **+X**, and the top row at **+Y**;
+`environment_rotation` turns the image about **+Y**.
+
 ```jsonc
 {
     "type": "postprocess_config",
@@ -866,14 +874,18 @@ the file bytes, so the same image on both devices never travels.
 ```
 
 - **Sender**: send the blob before the `shading_config` that names it. Do not send it
-  again. Do not send blobs to peers without the `asset` capability.
+  again. Do not send blobs to peers without the `asset` capability. Nomad holds its
+  built-ins back and serves them on request: another Nomad already has those bytes.
 - **Receiver**: for an unknown id, ignore the name (a local file of the same name is not
-  the same image), keep the current asset and send
+  the same image) unless its bytes hash to that id, keep the current asset and send
   `{"type": "request_asset", "collection": "…", "asset_id": "…"}`. Apply the config once
   the blob arrives. Reply with `error` if an id cannot be provided.
 - Asset blobs are not live edits. They are not gated by `live_sync`; ignore duplicates and
   relay them to viewers.
 - Treat `name` as untrusted display data (basename only), never as a path.
+- A peer with no equivalent for a collection ignores those blobs; the capability covers
+  both. The reference Blender extension maps `environments` onto the world background and
+  ignores `matcaps`.
 - Nomad keeps a received image for the session only, and embeds it into a saved project.
 
 ## 11. Versioning

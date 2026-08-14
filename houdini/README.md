@@ -57,7 +57,11 @@ to discover Nomad by UDP broadcast/Bonjour), then **Get Selection** or
 | roughness, metalness | point `rough`, `metallic` |
 | sculpt mask, dyntopo density | point `mask`, `density` |
 | face groups | prim `nomad_face_group` |
+| hidden faces | prim `nomad_face_hidden` (1 = hidden; the polygons are still built) |
 | object name | prim `name` (Split/Group by `name` separates meshes) |
+
+Hidden objects are skipped by the In SOP, so Nomad's visibility toggle reaches
+Houdini.
 
 **Houdini → Nomad.** Drop a *Nomad Link Out* under the geometry you want to send
 and press **Send to Nomad**. *Auto Send on Change* sends once per cook (off by

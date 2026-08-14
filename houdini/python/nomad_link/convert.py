@@ -106,10 +106,11 @@ def decode_mesh(header, binary):
         "geometry_id": header.get("geometry_id", ""),
         "name": header.get("name", "nomad"),
         "world_matrix": list(header.get("world_matrix", IDENTITY)),
-        "visible": True,
         "smooth_shading": bool(header.get("smooth_shading", True)),
         "positions": _read(binary, header["position_offset"], count * 3, "<f4").reshape(-1, 3).copy(),
     }
+    if "visible" in header:  # absent leaves the cached flag alone (client._store)
+        mesh["visible"] = bool(header["visible"])
 
     if header.get("face_format") == "corners":
         corner_count = int(header["corner_count"])
@@ -147,6 +148,8 @@ def decode_mesh(header, binary):
             str(group.get("name", "group%d" % i))
             for i, group in enumerate(header.get("face_groups", []))
         ]
+    if "face_hidden_offset" in header:
+        mesh["face_hidden"] = _read(binary, header["face_hidden_offset"], faces, "u1").astype(numpy.int32)
     return mesh
 
 
@@ -179,8 +182,8 @@ def apply_delta(mesh, header, binary):
 
 def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
                 texcoords=None, corner_uv=None, point_attribs=None, face_group=None,
-                face_group_names=(), world_matrix=None, ngon=True, smooth_shading=True,
-                request_id="", live_sync=False):
+                face_group_names=(), face_hidden=None, world_matrix=None, ngon=True,
+                smooth_shading=True, request_id="", live_sync=False):
     """Build a mesh_full (header, binary) from flat arrays.
 
     `positions` is (n, 3) float, `sizes`/`corners` describe the faces, and
@@ -224,7 +227,7 @@ def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
         if corner_uv is not None:
             header["corner_texcoord_offset"] = len(binary)
             binary.extend(numpy.asarray(corner_uv, "<i4").tobytes())
-        groups = face_group
+        groups, hidden = face_group, face_hidden
     else:
         inputs = [corners] if corner_uv is None else [corners, corner_uv]
         packed, mapping = corners_to_quads(sizes, *inputs)
@@ -236,6 +239,7 @@ def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
             header["face_uv_offset"] = len(binary)
             binary.extend(packed[1].astype("<i4").tobytes())
         groups = None if face_group is None else numpy.asarray(face_group)[mapping]
+        hidden = None if face_hidden is None else numpy.asarray(face_hidden)[mapping]
 
     if texcoords is not None:
         texcoords = numpy.asarray(texcoords, numpy.float32).reshape(-1, 2)
@@ -267,6 +271,10 @@ def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
         header["face_group_format"] = "uint16"
         binary.extend(numpy.clip(groups, 0, 65535).astype("<u2").tobytes())
         header["face_groups"] = [{"name": str(n)} for n in face_group_names]
+    if hidden is not None:
+        header["face_hidden_offset"] = len(binary)
+        header["face_hidden_format"] = "uint8"
+        binary.extend((numpy.asarray(hidden) != 0).astype("u1").tobytes())
 
     header["binary_size"] = len(binary)
     return header, bytes(binary)

@@ -42,6 +42,7 @@ def test_ngon_round_trip():
         point_attribs={"color": numpy.linspace(0, 1, 21).reshape(7, 3),
                        "rough": numpy.linspace(0, 1, 7)},
         face_group=numpy.array([0, 1, 1], "i4"), face_group_names=("a", "b"),
+        face_hidden=numpy.array([0, 1, 0], "i4"),
         ngon=True,
     )
     check(header["binary_size"] == len(binary), "binary_size matches the payload")
@@ -55,6 +56,8 @@ def test_ngon_round_trip():
           "rgbm8 colour round trips within a byte")
     check(numpy.allclose(mesh["rough"], numpy.linspace(0, 1, 7), atol=0.01), "roughness round trips")
     check(numpy.array_equal(mesh["face_group"], [0, 1, 1]), "face groups survive")
+    check(numpy.array_equal(mesh["face_hidden"], [0, 1, 0]), "hidden faces survive")
+    check("visible" not in mesh, "no visible in the header leaves the flag unset")
 
 
 def test_quad_split():
@@ -63,6 +66,7 @@ def test_quad_split():
         mesh_id="m", geometry_id="g", name="mixed",
         positions=points, sizes=sizes, corners=corners,
         face_group=numpy.array([7, 8, 9], "i4"), face_group_names=("a", "b", "c"),
+        face_hidden=numpy.array([0, 1, 0], "i4"),
         ngon=False,
     )
     mesh = convert.decode_mesh(header, binary)
@@ -72,6 +76,8 @@ def test_quad_split():
     # groups 7 and 9 are the two triangles; group 8's pentagon becomes three faces
     check(sorted(mesh["face_group"].tolist()) == [7, 8, 8, 8, 9],
           "face groups follow the split: %s" % mesh["face_group"].tolist())
+    check(numpy.array_equal(mesh["face_hidden"] == 1, mesh["face_group"] == 8),
+          "hidden faces follow the split with their group: %s" % mesh["face_hidden"].tolist())
     areas = {tuple(sorted(part.tolist())) for part in
              numpy.split(mesh["corners"], numpy.cumsum(mesh["sizes"])[:-1])}
     check((0, 1, 2) in areas, "original triangle survives the split")

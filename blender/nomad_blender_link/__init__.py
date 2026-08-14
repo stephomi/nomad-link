@@ -31,6 +31,10 @@ GEOMETRY_ID = "nomad_geometry_id"
 REPEAT_TAG = "nomad_repeat"
 TRANSFORM_PARENT_ID = "nomad_transform_parent_id"  # legacy, purged on connect (skew rides matrix_parent_inverse now)
 MATERIAL_ID = "nomad_link_material"
+ASSET_ID = "nomad_asset_id"  # matcap/environment blobs, the shading counterpart of nomad_texture_id
+# Nomad samples its equirect with the image centre at -Z in a Y-up world, Blender's sits at
+# +X: the world vector needs this fixed twist about Z before the HDRI's own rotation
+ENVIRONMENT_TWIST = -90.0
 FACE_GROUP_ATTRIBUTE = "nomad_face_group"
 FACE_SET_ATTRIBUTE = ".sculpt_face_set"  # Blender's own face sets, mirrored from the groups
 HIDE_FACE_ATTRIBUTE = ".hide_poly"  # Nomad's hidden faces
@@ -47,7 +51,9 @@ TO_BLENDER = TO_NOMAD.inverted()
 
 # "texture" on top of the shared bridge defaults: only this client handles blobs
 connection = Connection(
-    client_name="Blender", capabilities=DEFAULT_CAPABILITIES + ["texture", "ngon", "hierarchy", "scene_batch"]
+    client_name="Blender",
+    capabilities=DEFAULT_CAPABILITIES
+    + ["texture", "asset", "shading_config", "ngon", "hierarchy", "scene_batch"],
 )
 pending_objects = {}
 pending_transfers = []
@@ -81,6 +87,11 @@ session_source = ""  # client_name of the device sending live edits (may be this
 texture_requested = set()  # ids with an in-flight request_texture
 pending_materials = {}  # link_id -> material settings waiting for texture blobs
 sent_textures = set()  # ids whose blob already went to Nomad this session
+asset_requested = set()  # ids with an in-flight request_asset
+sent_assets = set()  # environment ids whose blob already went to Nomad this session
+pending_shading = None  # shading config waiting for its environment blob
+world_state = None  # last observed world background, for live change detection
+viewport_shown = set()  # Material Preview settings already pointed at the scene, once per session
 
 VIEWPORT_SENSOR_WIDTH = 36.0
 VIEWPORT_ZOOM = 2.0
@@ -739,6 +750,28 @@ def request_texture(texture_id):
         return
     texture_requested.add(texture_id)
     connection.send({"type": "request_texture", "texture_id": texture_id})
+
+
+def find_asset_image(asset_id):
+    for image in bpy.data.images:
+        if str(image.get(ASSET_ID, "")) == asset_id:
+            return image
+    return None
+
+
+def ensure_asset_id(image):
+    asset_id = str(image.get(ASSET_ID, ""))
+    if not asset_id:
+        asset_id = uuid.uuid4().hex  # opaque on the wire: Nomad's own ids are content hashes
+        image[ASSET_ID] = asset_id
+    return asset_id
+
+
+def request_asset(asset_id):
+    if asset_id in asset_requested:
+        return
+    asset_requested.add(asset_id)
+    connection.send({"type": "request_asset", "collection": "environments", "asset_id": asset_id})
 
 
 def apply_material_textures(material, shader, settings, link_id, has_uv):
@@ -2263,6 +2296,9 @@ def send_scope(scene, scope):
     if not objects:
         raise RuntimeError(f"No supported {scope.lower()} objects")
     pending_transfers.extend(obj.as_pointer() for obj in objects)
+    # the scene's look travels with a scene transfer, whatever the channel says (§10.1)
+    if scope == "SCENE" and "shading_config" in remote_capabilities:
+        send_world(False)
 
 
 def replace_scene_objects(scene):
@@ -2375,6 +2411,236 @@ def send_requested_texture(header):
     )
 
 
+def world_output_background(world):
+    """The Background node feeding the world output, if there is one."""
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    for node in world.node_tree.nodes:
+        if node.bl_idname != "ShaderNodeOutputWorld" or not node.is_active_output:
+            continue
+        for link in node.inputs["Surface"].links:
+            if link.from_node.bl_idname == "ShaderNodeBackground":
+                return link.from_node
+    return None
+
+
+def world_chain(create):
+    """(background, environment texture, mapping) of the world scene, built on demand.
+
+    Existing nodes are reused, so a hand-built world keeps its graph: only what Nomad
+    drives is added. Texture Coordinate → Generated is the view direction in a world tree,
+    which is what the mapping rotates.
+    """
+    world = bpy.context.scene.world
+    if world is None:
+        if not create:
+            return None, None, None
+        world = bpy.data.worlds.new("Nomad Environment")
+        bpy.context.scene.world = world
+    if not world.use_nodes:
+        if not create:
+            return None, None, None
+        world.use_nodes = True
+    background = world_output_background(world)
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    if background is None:
+        if not create:
+            return None, None, None
+        background = nodes.new("ShaderNodeBackground")
+        background.location = (-200.0, 300.0)
+        output = next((node for node in nodes if node.bl_idname == "ShaderNodeOutputWorld"), None)
+        if output is None:
+            output = nodes.new("ShaderNodeOutputWorld")
+            output.location = (0.0, 300.0)
+        output.is_active_output = True  # else the next read finds no background and builds again
+        links.new(background.outputs["Background"], output.inputs["Surface"])
+    environment = next(
+        (
+            link.from_node
+            for link in background.inputs["Color"].links
+            if link.from_node.bl_idname == "ShaderNodeTexEnvironment"
+        ),
+        None,
+    )
+    if environment is None:
+        if not create:
+            return background, None, None
+        environment = nodes.new("ShaderNodeTexEnvironment")
+        environment.location = (-560.0, 300.0)
+        links.new(environment.outputs["Color"], background.inputs["Color"])
+    mapping = next(
+        (
+            link.from_node
+            for link in environment.inputs["Vector"].links
+            if link.from_node.bl_idname == "ShaderNodeMapping"
+        ),
+        None,
+    )
+    if mapping is None and create:
+        mapping = nodes.new("ShaderNodeMapping")
+        mapping.vector_type = "VECTOR"  # a direction: the location input stays out of it
+        mapping.location = (-760.0, 300.0)
+        coordinates = nodes.new("ShaderNodeTexCoord")
+        coordinates.location = (-960.0, 300.0)
+        links.new(coordinates.outputs["Generated"], mapping.inputs["Vector"])
+        links.new(mapping.outputs["Vector"], environment.inputs["Vector"])
+    return background, environment, mapping
+
+
+def show_scene_shading(attribute):
+    """Material Preview ignores the scene world and the scene lights by default, so what
+    Nomad syncs would be invisible there. Point it at the scene once per session, and only
+    in viewports the user already has in that mode — Rendered uses both on its own."""
+    if attribute in viewport_shown:
+        return
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            space = area.spaces.active if area.type == "VIEW_3D" else None
+            if space is None or space.shading.type != "MATERIAL":
+                continue
+            if getattr(space.shading, attribute):
+                continue
+            setattr(space.shading, attribute, True)
+            viewport_shown.add(attribute)  # never twice: turning it back off must stick
+            area.tag_redraw()
+
+
+def apply_shading_config(settings):
+    """Nomad's environment onto the world background. The rest of the shading block
+    (matcap, shader mode, overlays) has no Blender equivalent and is ignored; a built-in
+    Nomad environment carries no blob, so only its rotation and exposure land here."""
+    global pending_shading, undo_pending, world_state
+    asset_id = str(settings.get("environment_id", ""))
+    image = find_asset_image(asset_id) if asset_id else None
+    if asset_id and image is None:
+        pending_shading = dict(settings)  # replayed by receive_asset once the pixels land
+        request_asset(asset_id)
+        return
+    background, environment, mapping = world_chain(create=image is not None)
+    if background is None:
+        return
+    undo_pending = True
+    if image is not None and environment is not None:
+        if environment.image is not image:
+            environment.image = image
+        show_scene_shading("use_scene_world")
+    if mapping is not None and "environment_rotation" in settings:
+        rotation = mapping.inputs["Rotation"].default_value
+        rotation[2] = math.radians(ENVIRONMENT_TWIST - float(settings["environment_rotation"]))
+    if "environment_exposure" in settings or "environment_enable" in settings:
+        exposure = float(settings.get("environment_exposure", 1.0))
+        # Nomad's environment toggle drops the world's contribution entirely
+        background.inputs["Strength"].default_value = (
+            exposure if bool(settings.get("environment_enable", True)) else 0.0
+        )
+    world_state = world_signature()  # what we now show, so the poll does not echo it back
+
+
+def receive_shading_config(header):
+    settings = header.get("shading")
+    if isinstance(settings, dict):
+        apply_shading_config(settings)
+
+
+def receive_asset(header, binary):
+    """An environment blob: a cache fill for the shading config, never an edit by itself."""
+    global pending_shading
+    asset_id = str(header.get("asset_id", ""))
+    if not asset_id or not binary:
+        return
+    asset_requested.discard(asset_id)
+    if header.get("collection") != "environments":
+        return  # Blender has no material-level matcap: those blobs are ignored on purpose
+    sent_assets.add(asset_id)  # Nomad holds what it just sent: never echo the blob back
+    if find_asset_image(asset_id) is None:
+        name = Path(str(header.get("name", ""))).name or "nomad_environment.hdr"
+        image = image_from_bytes(name, bytes(binary))
+        image[ASSET_ID] = asset_id
+    if pending_shading is not None:
+        settings = pending_shading
+        pending_shading = None
+        apply_shading_config(settings)
+
+
+def send_requested_asset(header):
+    asset_id = str(header.get("asset_id", ""))
+    data, name = image_bytes(find_asset_image(asset_id))
+    if data is None:
+        connection.send(
+            {"type": "error", "message": "Unknown asset", "request_id": header.get("request_id", "")}
+        )
+        return
+    connection.send(
+        {
+            "type": "asset",
+            "collection": "environments",
+            "asset_id": asset_id,
+            "name": name,
+            "binary_size": len(data),
+        },
+        data,
+    )
+
+
+def world_environment():
+    """(image, rotation in Nomad degrees, strength) of the world background."""
+    background, environment, mapping = world_chain(create=False)
+    if background is None or environment is None or environment.image is None:
+        return None, 0.0, 0.0
+    twist = 0.0 if mapping is None else math.degrees(mapping.inputs["Rotation"].default_value[2])
+    return (
+        environment.image,
+        (ENVIRONMENT_TWIST - twist) % 360.0,
+        background.inputs["Strength"].default_value,
+    )
+
+
+def world_signature():
+    image, rotation, strength = world_environment()
+    return (image.name_full if image is not None else "", round(rotation, 4), round(strength, 6))
+
+
+def send_world(live):
+    """The world background as Nomad's environment keys, its blob first."""
+    image, rotation, strength = world_environment()
+    if image is None:
+        return False
+    asset_id = ensure_asset_id(image)
+    name = Path(image.filepath).name or image.name
+    if asset_id not in sent_assets:
+        data, blob_name = image_bytes(image)
+        if data is None:
+            return False  # generated or unsaved: there is no file to share
+        name = blob_name
+        if "asset" in remote_capabilities:
+            connection.send(
+                {
+                    "type": "asset",
+                    "collection": "environments",
+                    "asset_id": asset_id,
+                    "name": name,
+                    "binary_size": len(data),
+                },
+                data,
+            )
+            sent_assets.add(asset_id)
+    connection.send(
+        {
+            "type": "shading_config",
+            "live_sync": live,
+            "shading": {
+                "environment_name": name,
+                "environment_id": asset_id,
+                "environment_rotation": rotation,
+                "environment_exposure": strength if strength > 0.0 else 1.0,
+                "environment_enable": strength > 0.0,
+            },
+        }
+    )
+    return True
+
+
 def receive_light(header):
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
@@ -2385,6 +2651,7 @@ def receive_light(header):
         obj[MESH_ID] = link_id
     if obj.type != "LIGHT":
         raise ValueError("Linked object is not a light")
+    show_scene_shading("use_scene_lights")
     light_type = header.get("light_type", "POINT")
     obj["nomad_light_type"] = light_type
     obj.data.type = light_type if light_type in {"POINT", "SUN", "SPOT", "AREA"} else "AREA"
@@ -2482,6 +2749,7 @@ def scene_config(scene):
         "sync_materials": scene.nomad_link_sync_materials,
         "sync_lights": scene.nomad_link_sync_lights,
         "sync_cameras": scene.nomad_link_sync_cameras,
+        "sync_shading": scene.nomad_link_sync_shading,
     }
 
 
@@ -2526,6 +2794,7 @@ def receive_session_config(header):
         "sync_materials": bool(header.get("sync_materials", False)),
         "sync_lights": bool(header.get("sync_lights", False)),
         "sync_cameras": bool(header.get("sync_cameras", False)),
+        "sync_shading": bool(header.get("sync_shading", False)),
     }
     sent = config_sent
     config_sent = None
@@ -2551,6 +2820,7 @@ def receive_session_config(header):
         scene.nomad_link_sync_materials = incoming["sync_materials"]
         scene.nomad_link_sync_lights = incoming["sync_lights"]
         scene.nomad_link_sync_cameras = incoming["sync_cameras"]
+        scene.nomad_link_sync_shading = incoming["sync_shading"]
     finally:
         applying_config = False
     config_desired = incoming
@@ -2615,7 +2885,7 @@ def receive_packet(header, binary):
     global session_source
     message_type = header.get("type")
     if message_type == "hello":
-        global membership_ready
+        global membership_ready, pending_shading, world_state
         pairing_wait = False
         config_revision = -1
         config_desired = None
@@ -2639,6 +2909,11 @@ def receive_packet(header, binary):
         texture_requested.clear()
         pending_materials.clear()
         sent_textures.clear()  # the image custom-prop ids are immutable, reconnects reuse them
+        asset_requested.clear()
+        sent_assets.clear()
+        pending_shading = None
+        world_state = None  # the new session re-baselines the world, it does not resend it
+        viewport_shown.clear()
         granted = header.get("pair_token", "")
         if granted and preferences() is not None:
             preferences().pair_token = granted
@@ -2719,6 +2994,14 @@ def receive_packet(header, binary):
         receive_texture(header, binary)
     elif message_type == "request_texture":
         send_requested_texture(header)
+    elif message_type == "shading_config" and live_allowed(
+        header, bpy.context.scene.nomad_link_sync_shading
+    ):
+        receive_shading_config(header)
+    elif message_type == "asset":
+        receive_asset(header, binary)
+    elif message_type == "request_asset":
+        send_requested_asset(header)
     elif message_type == "light" and live_allowed(
         header, bpy.context.scene.nomad_link_sync_lights
     ):
@@ -3011,6 +3294,21 @@ def poll_visibility(scene):
     visibility_states = seen
 
 
+def poll_world(scene):
+    """The world background carries no per-property depsgraph tag: diff what Nomad reads."""
+    global world_state
+    state = world_signature()
+    if state == world_state:
+        return
+    primed = world_state is not None  # the first observation is a baseline, not an edit
+    world_state = state
+    if not primed or not state[0] or not scene.nomad_link_sync_shading:
+        return
+    if not sends_live_scene(scene) or "shading_config" not in remote_capabilities:
+        return
+    send_world(True)
+
+
 def poll():
     if connection.status in {"Connecting", "Connected", "Listening"} and not activity_watch_running:
         try:
@@ -3052,6 +3350,7 @@ def poll():
             flush_transfers()
             poll_membership()
             poll_visibility(bpy.context.scene)
+            poll_world(bpy.context.scene)
             flush_dirty()
             poll_stale_recovery(bpy.context.scene)
             send_camera()
@@ -3368,6 +3667,7 @@ class NOMAD_PT_link(bpy.types.Panel):
         controls.prop(scene, "nomad_link_sync_materials")
         controls.prop(scene, "nomad_link_sync_lights")
         controls.prop(scene, "nomad_link_sync_cameras")
+        controls.prop(scene, "nomad_link_sync_shading")
         if scene.nomad_link_live_sync and not linked_object_count(scene):
             live.label(text="Use Send or Get once to link existing objects", icon="INFO")
 
@@ -3454,6 +3754,15 @@ def register():
     bpy.types.Scene.nomad_link_sync_cameras = bpy.props.BoolProperty(
         name="Cameras", default=False, update=settings_changed
     )
+    bpy.types.Scene.nomad_link_sync_shading = bpy.props.BoolProperty(
+        name="Shading",
+        description=(
+            "Nomad's shading channel. Blender maps the environment image, its rotation and "
+            "its exposure onto the world background; matcaps and viewport overlays are ignored"
+        ),
+        default=False,
+        update=settings_changed,
+    )
     bpy.types.Scene.nomad_link_auto_update = bpy.props.BoolProperty(name="Automatic Updates", default=True)
     if depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update)
@@ -3476,6 +3785,7 @@ def unregister():
         if undo_redo_post in handlers:
             handlers.remove(undo_redo_post)
     del bpy.types.Scene.nomad_link_auto_update
+    del bpy.types.Scene.nomad_link_sync_shading
     del bpy.types.Scene.nomad_link_sync_cameras
     del bpy.types.Scene.nomad_link_sync_lights
     del bpy.types.Scene.nomad_link_sync_materials

@@ -196,7 +196,8 @@ def cook_in(sop):
     _point_channel(geo, meshes, "mask", "mask", 1, 1.0)
     _point_channel(geo, meshes, "density", "density", 1, 0.0)
     if want_groups:
-        _face_groups(geo, meshes)
+        _face_channel(geo, meshes, "face_group", "nomad_face_group", offset_ids=True)
+    _face_channel(geo, meshes, "face_hidden", "nomad_face_hidden")
 
     # one string per primitive: Split/Group by `name` gives you each Nomad mesh
     geo.addAttrib(hou.attribType.Prim, "name", "")
@@ -234,16 +235,18 @@ def _point_channel(geo, meshes, key, attrib, size, default):
     _set_attrib(geo, hou.attribType.Point, attrib, numpy.concatenate(blocks), size, default)
 
 
-def _face_groups(geo, meshes):
-    if not any("face_group" in mesh for mesh in meshes):
+def _face_channel(geo, meshes, key, attrib, offset_ids=False):
+    """One int per primitive, meshes concatenated; group ids also get a per-mesh base."""
+    if not any(key in mesh for mesh in meshes):
         return
     values, base = [], 0
     for mesh in meshes:
         count = len(mesh["sizes"])
-        indices = numpy.asarray(mesh.get("face_group", numpy.zeros(count, numpy.int32)), numpy.int32)
-        values.append(indices + base)
-        base += max(len(mesh.get("face_group_names", ())), int(indices.max()) + 1 if count else 0)
-    _set_attrib(geo, hou.attribType.Prim, "nomad_face_group",
+        indices = numpy.asarray(mesh.get(key, numpy.zeros(count, numpy.int32)), numpy.int32)
+        values.append(indices + base if offset_ids else indices)
+        if offset_ids:
+            base += max(len(mesh.get("face_group_names", ())), int(indices.max()) + 1 if count else 0)
+    _set_attrib(geo, hou.attribType.Prim, attrib,
                 numpy.concatenate(values), 1, 0.0, integer=True)
 
 
@@ -268,6 +271,12 @@ def answer_request(header):
         except hou.Error:
             continue
         send_geometry(node, geo, request_id=header.get("request_id", ""))
+
+
+def _prim_ints(geo, name):
+    if geo.findPrimAttrib(name) is None:
+        return None
+    return numpy.array(geo.primIntAttribValues(name), numpy.int32)
 
 
 def _mesh_id(node):
@@ -322,12 +331,11 @@ def send_geometry(node, geo, request_id=""):
             values = numpy.array(geo.pointFloatAttribValues(attrib), numpy.float32)
             point_attribs[key] = values.reshape(count, size) if size > 1 else values
 
-    face_group = None
     group_names = ()
-    if geo.findPrimAttrib("nomad_face_group") is not None:
-        face_group = numpy.array(geo.primIntAttribValues("nomad_face_group"), numpy.int32)
-        if len(face_group):
-            group_names = ["Group %d" % (i + 1) for i in range(int(face_group.max()) + 1)]
+    face_group = _prim_ints(geo, "nomad_face_group")
+    face_hidden = _prim_ints(geo, "nomad_face_hidden")
+    if face_group is not None and len(face_group):
+        group_names = ["Group %d" % (i + 1) for i in range(int(face_group.max()) + 1)]
 
     world_matrix = list(convert.IDENTITY)
     if node.evalParm("applyxform"):
@@ -352,6 +360,7 @@ def send_geometry(node, geo, request_id=""):
         point_attribs=point_attribs,
         face_group=face_group,
         face_group_names=group_names,
+        face_hidden=face_hidden,
         world_matrix=world_matrix,
         ngon=link.peer_has("ngon"),
         request_id=request_id or uuid.uuid4().hex,
