@@ -18,8 +18,8 @@
         "network": "Discover and connect to Nomad Sculpt on the local network"
       },
       "archive_url": "./nomad_blender_link-0.11.38.zip",
-      "archive_size": 54349,
-      "archive_hash": "sha256:8abcd2cfb3c6278ea294ee9ae0ece961341da6f5473b9848d4c7d524516259ce"
+      "archive_size": 56896,
+      "archive_hash": "sha256:0c05ba10d531a8e20e10a84cdcea49ec34819803f07fd02cfbe1b9691c9fff59"
     }
   ]
 }

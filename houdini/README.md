@@ -83,9 +83,10 @@ Both node types carry the same connection parameters, so you only connect once.
 - **Apply Object Transform**: In bakes Nomad's `world_matrix` into the points,
   Out sends the containing object's transform as the mesh's `world_matrix`.
 
-Not implemented: materials and textures, lights, cameras, view sync, sculpt
-layers, and outgoing `mesh_delta` — every Houdini send is a full mesh, which is
-one undo step in Nomad. The capabilities in the `hello` are honest about this.
+Not implemented: materials and textures, matcap and environment images, lights,
+cameras, view sync, sculpt layers, and outgoing `mesh_delta` — every Houdini
+send is a full mesh, which is one undo step in Nomad. The capabilities in the
+`hello` are honest about this.
 
 ## Troubleshooting
 

@@ -6,7 +6,7 @@ sync with other applications: meshes, sculpt layers, paint, materials, lights, c
 **[PROTOCOL.md](PROTOCOL.md) is the wire specification** — enough to write a bridge for
 any application, in any language.
 
-Version **0.11.37**, protocol **1**.
+Version **0.11.38**, protocol **1**.
 
 ## Contents
 
@@ -21,18 +21,20 @@ Version **0.11.37**, protocol **1**.
   client: it implements every part of the specification
 - `blender/repository` — the published extension repository (`index.json` + archive)
 
-## Running a bridge
+## ZBrush
 
+Desktop Nomad speaks GoZ on its own: turn it on in the **Link** menu, nothing to
+install. Only Nomad on iPad needs the bridge script, running on the ZBrush computer.
 Download **[nomad-link-bridges.zip](https://github.com/stephomi/nomad-link/releases/latest/download/nomad-link-bridges.zip)**
-— the scripts only, no Blender extension. Unzip it, then run the one you want from that
-folder (Python 3, no dependencies to install):
+(the example scripts, no Blender extension), unzip it, then (Python 3 and numpy):
 
 ```
 python3 zbrush.py --help
 ```
 
 In Nomad, open the **Link** menu to start the server. The bridge finds it on the local
-network; approve the connection request in Nomad.
+network; approve the connection request in Nomad. The same folder holds `viewer.py` and
+`cozyblanket.py`, run the same way.
 
 ## Houdini assets
 
