@@ -11,6 +11,7 @@ Version **0.11.38**, protocol **1**.
 ## Contents
 
 - `PROTOCOL.md` — the specification
+- `CHANGELOG.md` — what changed in each version
 - `examples/transport.py` — framing and discovery, imported by the others
 - `examples/viewer.py` — minimal read-only client, prints every scene message
 - `examples/zbrush.py` — desktop ZBrush through GoZ (run it on the ZBrush computer)

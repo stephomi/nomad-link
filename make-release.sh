@@ -1,5 +1,6 @@
 #!/bin/sh
-# Maintainer only: publishes the release. Bump the version in README.md, run this.
+# Maintainer only: publishes the release. Bump the version in README.md, write the
+# CHANGELOG.md section, run this.
 set -e
 cd "$(dirname "$0")"
 PWD_ROOT=$PWD
@@ -18,6 +19,13 @@ ver=$(sed -n 's/^Version \*\*\([^*]*\)\*\*.*/\1/p' README.md)
 gh release view "$ver" >/dev/null 2>&1 &&
     { echo "$ver is already released, bump README.md" >&2; exit 1; }
 
+# release notes = the CHANGELOG.md section of that version
+notes=$(mktemp)
+trap 'rm -f "$notes"' EXIT
+awk -v head="## $ver" '$0 == head { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > "$notes"
+grep -q '[^[:space:]]' "$notes" ||
+    { echo "no '## $ver' section in CHANGELOG.md" >&2; exit 1; }
+
 # propagate the version
 sed -i '' "s/^VERSION = \"[^\"]*\"/VERSION = \"$ver\"/" examples/transport.py
 sed -i '' "s/^version = \"[^\"]*\"/version = \"$ver\"/" blender/nomad_blender_link/blender_manifest.toml
@@ -27,7 +35,7 @@ cp examples/transport.py toolbag/NomadLink/
 
 # bridges archive (stable name, /releases/latest/download/ depends on it)
 rm -f nomad-link-bridges.zip
-zip -qX -j nomad-link-bridges.zip README.md LICENSE PROTOCOL.md examples/*.py
+zip -qX -j nomad-link-bridges.zip README.md CHANGELOG.md LICENSE PROTOCOL.md examples/*.py
 
 # houdini archive (unpacks to a nomad-link-houdini folder, matching NOMAD_LINK in it)
 rm -f nomad-link-houdini.zip
@@ -55,6 +63,6 @@ rm -f blender/repository/nomad_blender_link-*.zip
 "$BLENDER" --command extension server-generate --repo-dir="$PWD/blender/repository" >/dev/null
 
 gh release create "$ver" nomad-link-bridges.zip nomad-link-houdini.zip \
-    nomad-link-toolbag.zip --title "$ver" --notes ""
+    nomad-link-toolbag.zip --title "$ver" --notes-file "$notes"
 
 echo "$ver done — upload blender/repository/* to https://nomadsculpt.com/blender/"

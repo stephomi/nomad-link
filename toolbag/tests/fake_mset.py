@@ -7,12 +7,14 @@ scene.py is exercised rather than bypassed.
 
 SCENE = []
 MATERIALS = []
+TEXTURES = {}
 
 
 def reset():
     del SCENE[:]
     del MATERIALS[:]
     del FRAMED[:]
+    TEXTURES.clear()
 
 
 class Mesh:
@@ -153,6 +155,18 @@ class SkyBoxObject(SceneObject):
         self.image = path
 
 
+class Texture:
+    """Toolbag hands back a texture object, not the path that was assigned."""
+
+    def __init__(self, path):
+        self.path = path
+        self.sRGB = True   # Toolbag's own default for a freshly loaded image
+
+
+def findTexture(path):
+    return TEXTURES.get(path)
+
+
 class MaterialSubroutine:
     def __init__(self, name, fields):
         self.name = name
@@ -167,6 +181,8 @@ class MaterialSubroutine:
     def setField(self, name, value):
         if name not in self._fields:
             raise ValueError("no such field: %s" % name)
+        if isinstance(value, str) and "map" in name.lower():
+            value = TEXTURES.setdefault(value, Texture(value))
         self._fields[name] = value
 
 
@@ -182,11 +198,14 @@ class Material:
         self.reflectivity = MaterialSubroutine(
             "Metalness", {"Metalness Map": None, "Channel": 0, "Metalness": 0.0,
                           "Invert": False})
-        self.surface = MaterialSubroutine("Normals", {"Normal Map": None, "Flip X": False})
+        self.surface = MaterialSubroutine(
+            "Normals", {"Normal Map": None, "Flip X": False, "Flip Y": False})
+        self.diffusion = MaterialSubroutine("Lambertian", {})
         # a default Toolbag material leaves these slots empty
         self.emission = None
         self.occlusion = None
         self.transparency = None
+        self.displacement = None
         MATERIALS.append(self)
 
     def setSubroutine(self, slot, shader):
@@ -199,6 +218,37 @@ class Material:
         if slot == "albedo" and shader == "Albedo":
             self.albedo = MaterialSubroutine("Albedo",
                                              {"Albedo Map": None, "Color": [1.0, 1.0, 1.0]})
+            return
+        # the slots a default material leaves empty, with the one shader this build takes
+        if slot == "emission" and shader == "Emissive":
+            self.emission = MaterialSubroutine(
+                "Emissive", {"Emissive Map": None, "Color": [1.0, 1.0, 1.0], "Intensity": 1.0})
+            return
+        if slot == "occlusion" and shader == "Occlusion":
+            self.occlusion = MaterialSubroutine(
+                "Occlusion", {"Occlusion Map": None, "Channel": 0, "Occlusion": 1.0})
+            return
+        if slot == "transparency" and shader == "Dither":
+            self.transparency = MaterialSubroutine(
+                "Dither", {"Alpha Map": None, "Channel": 3, "Alpha": 1.0})
+            return
+        if slot == "transparency" and shader in ("Add", "Refraction", "Cutout"):
+            fields = {"Alpha Map": None, "Channel": 3, "Alpha": 1.0}
+            if shader == "Refraction":
+                fields["IOR"] = 1.5
+            self.transparency = MaterialSubroutine(shader, fields)
+            return
+        if slot == "diffusion" and shader == "Subsurface Scatter":
+            self.diffusion = MaterialSubroutine(
+                "Subsurface Scatter", {"Scatter Map": None, "Subdermis Color": [1.0, 0.5, 0.4],
+                                       "Depth": 1.0})
+            return
+        if slot == "diffusion" and shader == "Lambertian":
+            self.diffusion = MaterialSubroutine("Lambertian", {})
+            return
+        if slot == "displacement" and shader == "Height":
+            self.displacement = MaterialSubroutine(
+                "Height", {"Height Map": None, "Channel": 0, "Scale": 1.0})
             return
         raise ValueError("unknown shader %s for %s" % (shader, slot))
 

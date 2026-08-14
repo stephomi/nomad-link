@@ -203,7 +203,8 @@ class ClientTest(unittest.TestCase):
         slot = material.albedo if material else None
         if slot is None or "Albedo Map" not in slot.getFieldNames():
             return None
-        return slot.getField("Albedo Map")
+        texture = slot.getField("Albedo Map")
+        return getattr(texture, "path", texture)
 
     def test_a_texture_arriving_late_is_applied_when_it_lands(self):
         self.send_cube()

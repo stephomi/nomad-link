@@ -287,8 +287,8 @@ class Probe:
         name = "Nomad probe material"
         material = _named(mset.getAllMaterials(), name) or mset.Material(name)
         self.keep.append(material)
-        for slot in ("albedo", "microsurface", "reflectivity", "surface",
-                     "emission", "occlusion", "transparency"):
+        for slot in ("albedo", "microsurface", "reflectivity", "surface", "emission",
+                     "occlusion", "transparency", "diffusion", "displacement"):
             try:
                 sub = getattr(material, slot)
                 self.say("%-16s %-18s %s" % (slot, sub.name, sub.getFieldNames()))
@@ -308,6 +308,23 @@ class Probe:
             material.setSubroutine("albedo", "Albedo")
         except Exception:
             pass
+
+        # the slots a default material leaves empty, and the ones a type switches
+        self.say("")
+        self.say("other shaders this build accepts:")
+        for slot, shaders in (("emission", ("Emissive",)),
+                              ("occlusion", ("Occlusion",)),
+                              ("transparency", ("Dither", "Alpha Blend", "Cutout", "Add",
+                                                "Refraction")),
+                              ("diffusion", ("Subsurface Scatter", "Lambertian")),
+                              ("displacement", ("Height", "Displacement"))):
+            for shader in shaders:
+                try:
+                    material.setSubroutine(slot, shader)
+                    self.say("  %-12s %-20s yes -> fields %s"
+                             % (slot, shader, getattr(material, slot).getFieldNames()))
+                except Exception as exc:
+                    self.say("  %-12s %-20s no (%s)" % (slot, shader, exc))
         return material
 
     def visual_check(self, obj, material):

@@ -342,11 +342,11 @@ class SceneTest(unittest.TestCase):
         self.scene.apply_material("cube", {"roughness": 0.25})
         self.assertAlmostEqual(material.microsurface.getField("Gloss"), 0.75, places=6)
 
-    def test_an_empty_slot_is_reported_not_crashed_into(self):
-        # a default Toolbag material has no transparency subroutine at all
-        mesh, built = self._cube()
-        self.scene.apply_mesh("cube", mesh, built)
-        material = self.scene.apply_material("cube", {"opacity": 0.4})
+    def test_a_slot_no_shader_can_fill_is_reported_not_crashed_into(self):
+        # a build that refuses every transparency shader must not take the plugin down
+        material = fake_mset.Material("picky")
+        material.setSubroutine = lambda slot, shader: (_ for _ in ()).throw(ValueError(shader))
+        self.assertFalse(self.scene._set(material, "transparency", [("alpha",)], 0.4))
         self.assertIsNone(material.transparency)
         self.assertTrue([line for line in self.logged if "transparency" in line])
 
@@ -382,7 +382,134 @@ class SceneTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(path))
         material = self.scene.apply_material("cube", {
             "textures": {"color": {"texture_id": "abc123", "name": "Sphere color.png"}}})
-        self.assertEqual(material.albedo.getField("Albedo Map"), path)
+        self.assertEqual(material.albedo.getField("Albedo Map").path, path)
+
+    def test_color_map_stays_srgb_while_paint_and_data_maps_do_not(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        color = self.scene.store_blob("c", "color.png", b"\x89PNG fake")
+        rough = self.scene.store_blob("r", "rough.png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"textures": {
+            "color": {"texture_id": "c"}, "roughness": {"texture_id": "r"}}},
+            has_paint=True)
+        self.assertIs(material.albedo.getField("sRGB Color"), False)
+        self.assertIs(fake_mset.findTexture(color).sRGB, True)
+        self.assertIs(fake_mset.findTexture(rough).sRGB, False)
+
+    def test_empty_slots_are_switched_on_for_the_channels_that_need_them(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        glow = self.scene.store_blob("e", "glow.png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"opacity": 0.5, "textures": {
+            "emissive": {"texture_id": "e", "factor": [1.0, 0.5, 0.0], "strength": 3.0}}})
+        self.assertEqual(material.emission.getField("Emissive Map").path, glow)
+        self.assertIs(fake_mset.findTexture(glow).sRGB, True)
+        self.assertEqual(material.emission.getField("Color"), [1.0, 0.5, 0.0])
+        self.assertAlmostEqual(material.emission.getField("Intensity"), 3.0, places=6)
+        self.assertAlmostEqual(material.transparency.getField("Alpha"), 0.5, places=6)
+
+    def test_an_emptied_channel_removes_the_map_it_had(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        self.scene.store_blob("e", "glow.png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"textures": {
+            "emissive": {"texture_id": "e", "strength": 2.0}}})
+        self.scene.apply_material("cube", {"textures": {"emissive": {}}})
+        self.assertIsNone(material.emission.getField("Emissive Map"))
+        self.assertAlmostEqual(material.emission.getField("Intensity"), 0.0, places=6)
+
+    def test_a_channel_still_waiting_for_its_pixels_keeps_the_current_map(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        path = self.scene.store_blob("here", "color.png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"textures": {
+            "color": {"texture_id": "here"}}})
+        self.scene.apply_material("cube", {"textures": {"color": {"texture_id": "later"}}})
+        self.assertEqual(material.albedo.getField("Albedo Map").path, path)
+
+    def test_the_factors_multiply_the_maps_they_belong_to(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        for blob in ("c", "r", "m", "o", "a"):
+            self.scene.store_blob(blob, blob + ".png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {
+            "color": [1.0, 0.5, 0.5], "roughness": 0.9, "metalness": 0.9, "opacity": 0.5,
+            "textures": {
+                "color": {"texture_id": "c", "factor": [0.5, 1.0, 1.0]},
+                "roughness": {"texture_id": "r", "factor": 0.25},
+                "metalness": {"texture_id": "m", "factor": 0.75},
+                "occlusion": {"texture_id": "o", "factor": 0.6},
+                "opacity": {"texture_id": "a", "factor": 0.4}}})
+        # the map replaces the slider, except for opacity where both multiply
+        self.assertEqual(material.albedo.getField("Color"), [0.5, 0.5, 0.5])
+        self.assertAlmostEqual(material.microsurface.getField("Roughness"), 0.25, places=6)
+        self.assertAlmostEqual(material.reflectivity.getField("Metalness"), 0.75, places=6)
+        self.assertAlmostEqual(material.occlusion.getField("Occlusion"), 0.6, places=6)
+        self.assertAlmostEqual(material.transparency.getField("Alpha"), 0.2, places=6)
+        self.assertEqual(material.transparency.getField("Channel"), 0)   # red
+
+    def test_a_flipped_normal_map_and_a_displacement_map_reach_their_slots(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        for blob in ("n", "d"):
+            self.scene.store_blob(blob, blob + ".png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"textures": {
+            "normal": {"texture_id": "n", "neg_y": True},
+            "displacement": {"texture_id": "d"}}})
+        self.assertIs(material.surface.getField("Flip Y"), True)
+        self.assertIsNotNone(material.displacement.getField("Height Map"))
+
+    def test_the_material_type_picks_the_slot_that_carries_it(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        material = self.scene.apply_material("cube", {
+            "material_type": "refraction", "refraction_ior": 1.33})
+        self.assertEqual(material.transparency.name, "Refraction")
+        self.assertAlmostEqual(material.transparency.getField("IOR"), 1.33, places=6)
+        self.scene.apply_material("cube", {"material_type": "additive"})
+        self.assertEqual(material.transparency.name, "Add")
+
+    def test_subsurface_lands_in_the_diffusion_slot_and_is_undone(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        material = self.scene.apply_material("cube", {
+            "material_type": "subsurface", "subsurface_color": [1.0, 0.2, 0.1],
+            "subsurface_depth": 2.5})
+        self.assertEqual(material.diffusion.name, "Subsurface Scatter")
+        self.assertEqual(material.diffusion.getField("Subdermis Color"), [1.0, 0.2, 0.1])
+        self.assertAlmostEqual(material.diffusion.getField("Depth"), 2.5, places=6)
+        self.scene.apply_material("cube", {"material_type": "opaque"})
+        self.assertEqual(material.diffusion.name, "Lambertian")
+
+    def test_an_auto_scatter_depth_keeps_toolbags_own(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        material = self.scene.apply_material("cube", {
+            "material_type": "subsurface", "subsurface_depth": -1})
+        self.assertAlmostEqual(material.diffusion.getField("Depth"), 1.0, places=6)
+
+    def test_removing_a_map_takes_its_factor_with_it(self):
+        for paint in (False, True):
+            fake_mset.reset()
+            self.scene = scene_module.Scene(log=self.logged.append)
+            mesh, built = self._cube()
+            self.scene.apply_mesh("cube", mesh, built)
+            for blob in ("c", "o", "a", "e"):
+                self.scene.store_blob(blob, blob + ".png", b"\x89PNG fake")
+            tinted = {"color": [1.0, 1.0, 1.0], "opacity": 1.0, "textures": {
+                "color": {"texture_id": "c", "factor": [1.0, 0.0, 0.0]},
+                "occlusion": {"texture_id": "o", "factor": 0.3},
+                "opacity": {"texture_id": "a", "factor": 0.5},
+                "emissive": {"texture_id": "e", "strength": 4.0}}}
+            material = self.scene.apply_material("cube", tinted, has_paint=paint)
+            self.assertEqual(material.albedo.getField("Color"), [1.0, 0.0, 0.0])
+            cleared = {"color": [1.0, 1.0, 1.0], "opacity": 1.0, "textures": {
+                "color": {}, "occlusion": {}, "opacity": {}, "emissive": {}}}
+            self.scene.apply_material("cube", cleared, has_paint=paint)
+            self.assertEqual(material.albedo.getField("Color"), [1.0, 1.0, 1.0])
+            self.assertAlmostEqual(material.occlusion.getField("Occlusion"), 1.0, places=6)
+            self.assertAlmostEqual(material.transparency.getField("Alpha"), 1.0, places=6)
+            self.assertAlmostEqual(material.emission.getField("Intensity"), 0.0, places=6)
 
     def test_blob_names_cannot_escape_the_cache_folder(self):
         path = self.scene.store_blob("evil", "../../etc/passwd", b"x")

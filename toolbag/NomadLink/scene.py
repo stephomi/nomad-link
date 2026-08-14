@@ -30,6 +30,31 @@ TEXTURE_SLOTS = {
     "emissive": ("emission", ("emissive", "map")),
     "occlusion": ("occlusion", ("occlusion", "map")),
     "opacity": ("transparency", ("map",)),
+    "displacement": ("displacement", ("map",)),
+}
+
+# the color channels are authored in sRGB, every other map is raw data
+SRGB_TEXTURES = ("color", "emissive")
+
+# a default Toolbag material leaves these slots off; the first shader that the
+# build accepts turns one on, so Nomad has somewhere to put the channel
+SLOT_SHADERS = {
+    "emission": ("Emissive",),
+    "occlusion": ("Occlusion",),
+    "transparency": ("Dither", "Alpha Blend", "Cutout", "Add"),
+    "displacement": ("Height", "Displacement"),   # only bites with subdivision on
+}
+
+# nomad material type -> the Toolbag transparency shader that stands for the same
+# look; subsurface is a diffusion shader instead, opaque and shadow_catcher neither
+MATERIAL_TYPES = {
+    "opaque": None,
+    "subsurface": None,
+    "shadow_catcher": None,
+    "blending": "Dither",
+    "dithering": "Dither",
+    "additive": "Add",
+    "refraction": "Refraction",
 }
 
 
@@ -366,16 +391,48 @@ class Scene:
             self._use_vertex_color(material, has_alpha)
         else:
             self._use_albedo_map(material)
-            color = block.get("color")
-            if color:
-                self._set(material, "albedo", [("color",)], list(color))
-        if "roughness" in block:
-            self._set_microsurface(material, float(block["roughness"]))
-        if "metalness" in block:
-            self._set(material, "reflectivity", [("metal",)], float(block["metalness"]))
-        if "opacity" in block and block["opacity"] < 1.0:
-            self._set(material, "transparency", [("alpha",), ("opacity",)],
-                      float(block["opacity"]))
+        self._apply_type(material, block)
+
+        # Nomad's slider and the map's factor both multiply the map, so each slot
+        # takes the factor once the map is there and the plain slider otherwise.
+        # Every one of them is written every time: a factor left behind by a map
+        # that has since been removed would tint the material for good.
+        tint = self._factor(textures, "color", [1.0, 1.0, 1.0])
+        color = (list(block.get("color") or []) if not has_paint else []) or [1.0, 1.0, 1.0]
+        if tint:
+            color = [c * t for c, t in zip(color, list(tint))]
+        self._set(material, "albedo", [("color",)], color)
+
+        rough = self._factor(textures, "roughness")
+        rough = block.get("roughness") if rough is None else rough
+        if rough is not None:
+            self._set_microsurface(material, float(rough))
+
+        metal = self._factor(textures, "metalness")
+        metal = block.get("metalness") if metal is None else metal
+        if metal is not None:
+            self._set(material, "reflectivity", [("metal",)], float(metal))
+
+        # the opacity map multiplies the slider rather than replacing it
+        opacity = self._factor(textures, "opacity")
+        alpha = float(block.get("opacity", 1.0)) * (1.0 if opacity is None else float(opacity))
+        if alpha < 1.0 or _subroutine(material, "transparency") is not None:
+            self._set(material, "transparency", [("alpha",), ("opacity",)], alpha)
+
+        # the slots below only exist because a map put them there, so they are
+        # written back to neutral rather than switched on for nothing
+        occlusion = self._factor(textures, "occlusion")
+        if occlusion is not None or _subroutine(material, "occlusion") is not None:
+            self._set(material, "occlusion", [("occlusion",)],
+                      1.0 if occlusion is None else float(occlusion))
+
+        glow = self._factor(textures, "emissive", [1.0, 1.0, 1.0])
+        if glow is not None:
+            self._set(material, "emission", [("color",)], list(glow))
+            strength = (textures.get("emissive") or {}).get("strength", 1.0)
+            self._set(material, "emission", [("intensity",), ("strength",)], float(strength))
+        elif _subroutine(material, "emission") is not None:
+            self._set(material, "emission", [("intensity",), ("strength",)], 0.0)
 
         self.trace("material textures")
         for channel, texture in textures.items():
@@ -411,6 +468,51 @@ class Scene:
         self._set(material, "albedo", [("vertex", "alpha")], bool(has_alpha))
         return True
 
+    def _apply_type(self, material, block):
+        """Nomad's material type -> the Toolbag slot that carries the same look."""
+        kind = block.get("material_type")
+        if kind is None:
+            return
+        if kind not in MATERIAL_TYPES:
+            self._log("unknown material type %s" % kind)
+            return
+        shader = MATERIAL_TYPES[kind]
+        if shader:
+            self._use_shader(material, "transparency", shader)
+        if kind == "refraction" and "refraction_ior" in block:
+            self._set(material, "transparency", [("ior",), ("index",)],
+                      float(block["refraction_ior"]))
+        if kind == "subsurface":
+            self._subsurface(material, block)
+        elif _scatters(material):
+            self._use_shader(material, "diffusion", "Lambertian")
+
+    def _subsurface(self, material, block):
+        """Toolbag scatters in the diffusion slot, so the type lands there rather
+        than on transparency. Nomad's depth is -1 when it wants its own default."""
+        self._use_shader(material, "diffusion", "Subsurface Scatter")
+        if not _scatters(material):
+            return
+        color = block.get("subsurface_color")
+        if color:
+            self._set(material, "diffusion",
+                      [("subdermis",), ("scatter", "color"), ("color",)], list(color))
+        depth = block.get("subsurface_depth")
+        if depth is not None and depth >= 0:
+            self._set(material, "diffusion", [("depth",)], float(depth))
+
+    def _use_shader(self, material, slot_name, shader):
+        """Switch a slot to a named shader, unless it is the one already running."""
+        slot = _subroutine(material, slot_name)
+        if _shader_name(slot) == shader.lower():
+            return slot
+        try:
+            material.setSubroutine(slot_name, shader)
+        except Exception:
+            self._log("no %s shader for %s" % (shader, slot_name))
+            return slot
+        return _subroutine(material, slot_name)
+
     def _use_albedo_map(self, material):
         """Undo a previous vertex-color swap so a color texture has a slot again."""
         if _find_field(_subroutine(material, "albedo"), ("map",), texture=True):
@@ -432,9 +534,25 @@ class Scene:
         return self._set(material, "microsurface", [("gloss",)] if gloss else [("rough",)],
                          1.0 - roughness if gloss else roughness)
 
+    def _slot(self, material, slot_name):
+        """The subroutine, switched on first if the material still has it empty."""
+        slot = _subroutine(material, slot_name)
+        if slot is not None:
+            return slot
+        for shader in SLOT_SHADERS.get(slot_name, ()):
+            try:
+                material.setSubroutine(slot_name, shader)
+            except Exception:
+                continue
+            slot = _subroutine(material, slot_name)
+            if slot is not None:
+                return slot
+        self._log("no %s slot on this material" % slot_name)
+        return None
+
     def _set(self, material, slot_name, candidates, value):
         """Set the first field matching any candidate; builds name them differently."""
-        slot = _subroutine(material, slot_name)
+        slot = self._slot(material, slot_name)
         field = next((f for f in (_find_field(slot, words, texture=False)
                                   for words in candidates) if f), None)
         if field is None:
@@ -448,23 +566,79 @@ class Scene:
             self._log("%s.%s not set: %s" % (slot_name, field, exc))
             return False
 
+    def _factor(self, textures, channel, default=1.0):
+        """The channel's factor, or None while no map of that channel is loaded."""
+        texture = textures.get(channel) or {}
+        if not self.blobs.get(texture.get("texture_id")):
+            return None
+        value = texture.get("factor")
+        return default if value is None else value
+
     def _apply_texture(self, material, channel, texture):
         slot_name, words = TEXTURE_SLOTS.get(channel, (None, None))
         if slot_name is None:
+            self._log("no slot for the %s channel" % channel)
             return False
-        path = self.blobs.get((texture or {}).get("texture_id"))
+        texture = texture or {}
+        if not texture.get("texture_id"):
+            return self._clear_texture(material, channel, slot_name, words)
+        path = self.blobs.get(texture["texture_id"])
         if not path:
-            return False
-        slot = _subroutine(material, slot_name)
+            return False   # the pixels have not landed yet, keep what is there
+        slot = self._slot(material, slot_name)
         field = _find_field(slot, words, texture=True)
         if field is None:
             self._log("no %s texture field" % slot_name)
             return False
         try:
             slot.setField(field, path)
-            return True
         except Exception as exc:
             self._log("%s texture not set: %s" % (slot_name, exc))
+            return False
+        # the color space lives on the texture, not on the slot, so the vertex
+        # color toggle below never speaks for the map sharing that slot
+        self._set_texture_srgb(slot, field, path, channel in SRGB_TEXTURES)
+        if channel == "opacity":
+            self._set(material, slot_name, [("channel",)], 0)   # Nomad reads the red one
+        if channel == "normal" and "neg_y" in texture:
+            self._set(material, slot_name, [("flip", "y")], bool(texture["neg_y"]))
+        return True
+
+    def _clear_texture(self, material, channel, slot_name, words):
+        """An empty channel means the map was removed, not that it is unchanged."""
+        slot = _subroutine(material, slot_name)   # never switch a slot on to empty it
+        field = _find_field(slot, words, texture=True)
+        if field is None:
+            return False
+        try:
+            slot.setField(field, None)
+        except Exception as exc:
+            self._log("%s texture not cleared: %s" % (slot_name, exc))
+            return False
+        # an Emissive slot with no map still glows its own color, so mute it
+        if channel == "emissive":
+            self._set(material, slot_name, [("intensity",), ("strength",)], 0.0)
+        return True
+
+    def _set_texture_srgb(self, slot, field, path, srgb):
+        texture = None
+        try:
+            texture = slot.getField(field)
+        except Exception:
+            pass
+        if not hasattr(texture, "sRGB"):
+            try:
+                texture = mset.findTexture(path)
+            except Exception:
+                texture = None
+        if not hasattr(texture, "sRGB"):
+            self._log("no texture object for %s; srgb left as loaded" % field)
+            return False
+        try:
+            texture.sRGB = bool(srgb)
+            return True
+        except Exception as exc:
+            self._log("srgb not set on %s: %s" % (field, exc))
             return False
 
     # ------------------------------------------------------------------- blobs
@@ -640,6 +814,14 @@ def _subroutine(material, slot):
         return None
 
 
+def _shader_name(slot):
+    return str(getattr(slot, "name", "")).lower()
+
+
+def _scatters(material):
+    return "subsurface" in _shader_name(_subroutine(material, "diffusion"))
+
+
 def _find_field(slot, words, texture):
     """First field whose name carries every word; 'map' marks the texture ones."""
     if slot is None:
@@ -714,4 +896,6 @@ _SLOT_ATTRIBUTES = {
     "emission": "emission",
     "occlusion": "occlusion",
     "transparency": "transparency",
+    "displacement": "displacement",
+    "diffusion": "diffusion",
 }

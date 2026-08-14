@@ -37,7 +37,7 @@ unfocused window catches up the moment you click back into it.
 | Updates | per-stroke deltas, paint refreshes, rename, hide, move, delete |
 | Instances | shared geometry, each copy placed by its own matrix |
 | Materials | roughness, metalness, color, opacity, and the texture channels below |
-| Textures | color, roughness, metalness, normal, emissive, occlusion, opacity |
+| Textures | color, roughness, metalness, normal, emissive, occlusion, opacity, displacement, each with its factor |
 | Environment | Nomad's HDRI onto the Toolbag sky, with its rotation, exposure and blur |
 | Lights | sun/point/spot as Toolbag lights: color or kelvin, brightness, cone, shadows |
 | Cameras | Nomad cameras as scene cameras to render through, incl. orthographic |
@@ -48,6 +48,8 @@ Deliberately not mapped:
 - **Hierarchy.** Everything arrives at the scene root, placed by its world matrix, which
   `PROTOCOL.md` §12 allows explicitly.
 - **Sculpt layers and masks.** They composite into what you see before sending.
+- **Texture placement.** Projection, wrapping, offset/scale/rotation stay at Toolbag's
+  defaults; triplanar is a global Toolbag setting rather than a per-material one.
 
 ## Speed
 
