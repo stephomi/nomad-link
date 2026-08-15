@@ -2,6 +2,13 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.40
+
+- Blender: the connection no longer stalls on "Waiting for Nomad" when another add-on keeps a
+  modal operator running. Session packets are applied while one is in flight; scene packets are
+  still held until it ends, and the panel shows how many are waiting.
+- No protocol change.
+
 ## 0.11.39
 
 - Toolbag: color and emissive maps are read as sRGB, every other channel as raw data. The

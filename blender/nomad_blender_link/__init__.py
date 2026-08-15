@@ -79,6 +79,8 @@ force_full_ids = set()
 sent_geometry = set()
 delta_cache = {}
 deferred_parents = {}  # link_id -> parent link_id whose object has not arrived yet (PROTOCOL §9)
+deferred_packets = []  # scene packets held while a modal operator runs, applied in order after it
+deferred_camera = None  # the newest view held with them: older ones are stale by then
 undo_pending = False  # a drained packet changed blend data: poll pushes one undo step for it
 KEEP_PARENT = object()  # sentinel: the header carried no parent_id, leave the parenting alone
 remote_capabilities = set()
@@ -96,6 +98,7 @@ viewport_shown = set()  # Material Preview settings already pointed at the scene
 VIEWPORT_SENSOR_WIDTH = 36.0
 VIEWPORT_ZOOM = 2.0
 SAFE_WRITE_MODES = {"OBJECT", "VERTEX_PAINT", "WEIGHT_PAINT", "TEXTURE_PAINT"}
+MODAL_SAFE = {"hello", "pairing_pending", "session_config", "error", "mesh_invalidated"}
 STALE_MESSAGE = "Live geometry paused; it refreshes automatically outside Edit Mode, Dyntopo, and Multires"
 MODIFIER_MESSAGE = "Objects sending their modifier results cannot receive; turn off Send Modifier Results"
 LAYER_DTYPE = numpy.dtype([("index", "<u4"), ("offset", "<f4", 3)])
@@ -2885,7 +2888,7 @@ def receive_packet(header, binary):
     global session_source
     message_type = header.get("type")
     if message_type == "hello":
-        global membership_ready, pending_shading, world_state
+        global membership_ready, pending_shading, world_state, deferred_camera
         pairing_wait = False
         config_revision = -1
         config_desired = None
@@ -2897,6 +2900,8 @@ def receive_packet(header, binary):
         # must never be relayed as object_delete into the new session
         known_objects.clear()
         dirty_objects.clear()
+        deferred_packets.clear()  # held packets belong to the session that just ended
+        deferred_camera = None
         membership_ready = False
         remote_capabilities.clear()
         remote_capabilities.update(header.get("capabilities", []))
@@ -3316,9 +3321,33 @@ def poll():
         except RuntimeError:
             pass  # no window yet: retried next poll
     # applying a packet rebuilds obj.data and can flip object mode: under a running brush stroke
-    # that leaves the sculpt session on freed data and Blender dies on stroke end. Leave them
-    # queued, the same gate Nomad puts on its own receive
-    if modal_operator_running():
+    # that leaves the sculpt session on freed data and Blender dies on stroke end. Hold those,
+    # the same gate Nomad puts on its own receive; session packets touch no blend data and are
+    # always applied, so the handshake never waits on an add-on that keeps a modal operator alive
+    global deferred_camera
+    modal = modal_operator_running()
+    latest_camera = None
+    if not modal:
+        latest_camera = deferred_camera  # the view held through the operator, applied once
+        deferred_camera = None
+    packets = deferred_packets[:] + connection.poll()  # held ones first: the order they arrived in
+    deferred_packets.clear()
+    for header, binary in packets:
+        message_type = header.get("type")
+        if message_type == "camera":
+            if modal:
+                deferred_camera = header
+            else:
+                latest_camera = header
+            continue
+        if modal and message_type not in MODAL_SAFE:
+            deferred_packets.append((header, binary))
+            continue
+        try:
+            receive_packet(header, binary)
+        except Exception as exc:
+            connection.error = str(exc)
+    if modal:
         # the outgoing view only reads the view matrix: orbiting keeps streaming mid-gesture
         try:
             if connection.status == "Connected":
@@ -3326,15 +3355,6 @@ def poll():
         except Exception as exc:
             connection.error = str(exc)
         return 1.0 / 60.0
-    latest_camera = None
-    for header, binary in connection.poll():
-        try:
-            if header.get("type") == "camera":
-                latest_camera = header
-            else:
-                receive_packet(header, binary)
-        except Exception as exc:
-            connection.error = str(exc)
     global undo_pending
     try:
         if deferred_parents:
@@ -3461,10 +3481,13 @@ class NOMAD_OT_discover(bpy.types.Operator):
 
 def reset_link_state():
     global active_source, claim_pending, config_desired, config_revision, config_sent, pairing_wait, session_source
+    global deferred_camera
     pending_objects.clear()
     pending_transfers.clear()
     delta_cache.clear()
     deferred_parents.clear()
+    deferred_packets.clear()
+    deferred_camera = None
     remote_capabilities.clear()
     session_devices.clear()
     texture_requested.clear()
@@ -3612,6 +3635,11 @@ class NOMAD_PT_link(bpy.types.Panel):
         layout.label(text=f"Extension: {VERSION} · {BUILD}" if DEV else f"Extension: {VERSION}")
         if connection.error:
             layout.label(text=connection.error, icon="ERROR")
+        if deferred_packets:
+            layout.label(
+                text=f"{len(deferred_packets)} updates held while a modal operator runs",
+                icon="INFO",
+            )
         if update_required:
             layout.label(text=f"Version {update_required}+ required", icon="ERROR")
             layout.operator("nomad.update_extension", icon="FILE_REFRESH")
