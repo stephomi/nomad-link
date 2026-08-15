@@ -81,7 +81,7 @@ class Scene:
         self.submeshes = {}      # link_id -> its SubMeshObject (needed to render)
         self.materials = {}      # link_id -> mset.Material
         self.blobs = {}          # texture_id / asset_id -> path on disk
-        self.follow_view = False
+        self.follow_view = False    # replica of Nomad's shared sync_view (client.py)
         self.needs_normals = None   # unknown until the first mesh is written
         self._unit = None           # scene units per meter, asked once
         self.trace_path = ""
@@ -217,7 +217,13 @@ class Scene:
         raise failure or RuntimeError("could not build an mset.Mesh")
 
     def trace(self, what):
-        """Breadcrumb for a crash: the file holds the last calls attempted."""
+        """Breadcrumb for a crash: the file holds the last calls attempted.
+
+        Flushed but deliberately NOT fsynced: what this has to survive is Toolbag
+        dying, and the kernel keeps a written buffer when a process does. fsync
+        buys durability against a power cut instead, at a disk barrier per step —
+        several per mesh, on the callback Toolbag asks us to keep cheap.
+        """
         if not TRACE or not self.trace_path:
             return
         self._steps.append(what)
@@ -226,7 +232,6 @@ class Scene:
             with open(self.trace_path, "w") as handle:
                 handle.write("\n".join(self._steps) + "\n")
                 handle.flush()
-                os.fsync(handle.fileno())
         except OSError:
             pass
 

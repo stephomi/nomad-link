@@ -110,11 +110,18 @@ class Client:
         self.nomad_version = ""
         self.peer_capabilities = set()
         self.session_config = {}
+        self.config_revision = -1   # -1 = Nomad has not sent its settings yet
         self.meshes = {}          # link_id -> decoded mesh (convert.decode_mesh)
         self.lights = {}          # link_id -> merged light block (edits are partial)
         self.cameras = {}         # link_id -> merged camera_object block
         self.log = []
         self.counts = {"meshes": 0, "updates": 0}
+        # where the time goes, measured rather than assumed (the Toolbag docs only
+        # promise onPeriodicUpdate runs "a few times per second")
+        self.stats = {"rate": 0.0, "busy": 0.0, "packets": 0,
+                      "convert": 0.0, "write": 0.0}
+        self._dirty = {}          # link_id -> pending geometry write, one per tick
+        self._window = [0.0, 0, 0, 0.0]   # since, ticks, packets, busy
         self._materials = {}      # link_id -> last material block, for texture arrivals
         self._shading = None      # last shading block, for asset arrivals
         self._requested = set()
@@ -180,6 +187,8 @@ class Client:
         self._wanted = False
         self.connection.disconnect()
         self.peer_capabilities = set()
+        self.session_config = {}
+        self.config_revision = -1
         self.nomad_version = ""
         self.message = "Disconnected"
 
@@ -199,6 +208,24 @@ class Client:
         self._requested.clear()
         return self.send({"type": "request_%s" % what, "request_id": uuid.uuid4().hex})
 
+    def set_sync_view(self, enabled):
+        """The panel's follow checkbox is Nomad's shared `sync_view` (Blender calls
+        it Working View), so it asks and the echoed config confirms. `sync_mode` has
+        to travel back or Nomad refuses the whole message; the flags left out keep
+        the value they already have."""
+        enabled = bool(enabled)
+        self.scene.follow_view = enabled
+        if not self.connected or self.config_revision < 0:
+            return False
+        # PROTOCOL.md §5 wants the whole flag set back; the replica cannot be stale
+        # behind it because base_revision would then be refused
+        flags = {key: value for key, value in self.session_config.items()
+                 if key == "live_sync" or key.startswith("sync_")}
+        flags["sync_mode"] = self.session_config.get("sync_mode", "auto")
+        flags["sync_view"] = enabled
+        return self.send(dict(flags, type="set_session_config",
+                              base_revision=self.config_revision))
+
     def note(self, text):
         self.log.append(text)
         del self.log[:-200]
@@ -207,18 +234,22 @@ class Client:
 
     def pump(self):
         """Drain the socket queue. Main thread only."""
-        drained = False
+        started = time.time()
+        packets = 0
         for header, binary in self.connection.poll():
-            drained = True
+            packets += 1
             self.scene.trace("message %s" % header.get("type"))
             try:
                 self._handle(header, binary)
             except Exception as exc:  # one bad packet must not kill the callback
                 self.note("error handling %s: %s" % (header.get("type"), exc))
-        if drained:
+        if self._dirty:
+            self._flush_geometry()
+        if packets:
             # a crash after this breadcrumb is Toolbag's own work on what it was
             # just given, not a call this bridge made
             self.scene.trace("queue drained")
+        self._measure(started, packets)
         now = time.time()
         if self.connection.status == "Error":
             if self.message != self.connection.error:
@@ -228,6 +259,40 @@ class Client:
         elif self.connected and now - self._last_ping > PING_INTERVAL:
             self._last_ping = now
             self.send({"type": "ping"})
+
+    def _flush_geometry(self):
+        """One write per mesh per tick. A stroke queues several deltas and only the
+        state they add up to is ever seen; each write also makes Toolbag rebuild the
+        mesh adjacency itself, so the saving is mostly its time, not ours."""
+        convert_ms = write_ms = 0.0
+        for link_id in self._dirty:
+            mesh = self.meshes.get(link_id)
+            if mesh is None:
+                continue        # deleted before the tick ended
+            start = time.time()
+            built = self._build(mesh)
+            middle = time.time()
+            self.scene.update_geometry(link_id, built)
+            self._refresh_group(link_id)
+            convert_ms += (middle - start) * 1000.0
+            write_ms += (time.time() - middle) * 1000.0
+        self._dirty.clear()
+        self.stats["convert"], self.stats["write"] = convert_ms, write_ms
+
+    def _measure(self, started, packets):
+        """How often Toolbag really calls back, and how much of that is us."""
+        now = time.time()
+        window = self._window
+        if not window[0]:
+            window[0] = started
+        window[1] += 1
+        window[2] += packets
+        window[3] += now - started
+        span = now - window[0]
+        if span >= 1.0:
+            self.stats.update(rate=window[1] / span, busy=window[3] / span,
+                              packets=window[2])
+            self._window = [now, 0, 0, 0.0]
 
     # ---------------------------------------------------------------- messages
 
@@ -257,7 +322,13 @@ class Client:
         self._requested.clear()
 
     def _on_session_config(self, header, _binary):
+        revision = int(header.get("revision", -1))
+        if revision < self.config_revision:
+            return                  # an older echo overtaking the settings we hold
+        self.config_revision = revision
         self.session_config = header
+        # Nomad owns the view flag; the panel checkbox only shows what it says
+        self.scene.follow_view = bool(header.get("sync_view", self.scene.follow_view))
 
     # -- geometry
 
@@ -270,6 +341,7 @@ class Client:
             self._materials[link_id] = mesh["material"]
         self.scene.apply_mesh(link_id, mesh, self._build(mesh))
         self._refresh_group(link_id)
+        self._dirty.pop(link_id, None)      # a full states everything a delta asked for
         self.counts["meshes"] = len(self.meshes)
         if header.get("request_id"):
             self.send({"type": "mesh_ack", "mesh_id": link_id,
@@ -288,15 +360,17 @@ class Client:
         mesh["world_matrix"] = list(header.get("world_matrix", convert.IDENTITY))
         self.meshes[link_id] = mesh
         self.scene.apply_mesh(link_id, mesh, self._build(mesh))
+        self._dirty.pop(link_id, None)
         self.counts["meshes"] = len(self.meshes)
 
     def _on_mesh_delta(self, header, binary):
+        """Patching the cached mesh is cheap; the write it earns waits for the end
+        of the batch, so a stroke's worth of deltas costs Toolbag one rebuild."""
         link_id = header.get("mesh_id", "")
         mesh = self.meshes.get(link_id)
         if mesh is None or not convert.apply_delta(mesh, header, binary):
             return self._recover(link_id)
-        self.scene.update_geometry(link_id, self._build(mesh))
-        self._refresh_group(link_id)
+        self._dirty[link_id] = True
         self.counts["updates"] += 1
 
     def _on_mesh_attributes(self, header, binary):
@@ -304,8 +378,7 @@ class Client:
         mesh = self.meshes.get(link_id)
         if mesh is None or not convert.apply_attributes(mesh, header, binary):
             return self._recover(link_id)
-        self.scene.update_geometry(link_id, self._build(mesh))
-        self._refresh_group(link_id)
+        self._dirty[link_id] = True
 
     def _on_light(self, header, _binary):
         link_id = header.get("link_id", "")

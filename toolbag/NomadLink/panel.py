@@ -13,6 +13,10 @@ except ImportError:  # unit tests inject a stand-in
 
 import client
 
+# the diagnostic row: how often Toolbag calls back, and what a mesh costs once it
+# does. Off = the row is never built (a Toolbag control cannot be hidden later)
+TIMING = True
+
 
 def _make(class_name, *args):
     factory = getattr(mset, class_name, None)
@@ -36,6 +40,7 @@ class Panel:
         self.window = _make("UIWindow", "Nomad Link")
         self.status = _make("UILabel", "Disconnected")
         self.detail = _make("UILabel", "")
+        self.timing = _make("UILabel", "") if TIMING else None
         self.host = _make("UITextField", "")
         self.port = _make("UITextFieldInt", 48312)
         self.find_button = _make("UIButton", "Find Nomad")
@@ -89,12 +94,15 @@ class Panel:
             [self.get_button, self.selection_button, self.replace_button],
             [self.status],
             [self.detail],
+            [self.timing],
             [self.follow],
             [probe_button, close],
         ):
-            for element in row:
-                if element is not None:
-                    self.window.addElement(element)
+            present = [element for element in row if element is not None]
+            if not present:
+                continue        # a row this Toolbag build has nothing for
+            for element in present:
+                self.window.addElement(element)
             self.window.addReturn()
 
     # ----------------------------------------------------------------- actions
@@ -148,7 +156,8 @@ class Panel:
             self.port.value = int(self.link.port)
 
     def on_follow(self):
-        self.link.scene.follow_view = bool(self.follow.value) if self.follow else False
+        """Shared with Nomad and every other bridge, so this asks rather than sets."""
+        self.link.set_sync_view(bool(self.follow.value) if self.follow else False)
 
     def on_probe(self):
         """Report what this Toolbag build actually does. Console has the detail."""
@@ -175,8 +184,24 @@ class Panel:
             self.status.text = self.link.message
         if self.detail is not None:
             self.detail.text = self._detail()
+        if self.timing is not None:
+            self.timing.text = self._timing()
         if self.connect_button is not None:
             self.connect_button.text = "Disconnect" if self.link.wanted else "Connect"
+        # the flag is shared: Nomad or another bridge can move it under us. Write it
+        # back only when it really differs, so a value write cannot echo as an edit
+        if self.follow is not None and bool(self.follow.value) != self.link.scene.follow_view:
+            self.follow.value = self.link.scene.follow_view
+
+    def _timing(self):
+        """Callback rate first: it is the one number the Toolbag docs never give,
+        and it decides whether a delay is the wait or the work."""
+        stats = self.link.stats
+        if not stats["rate"]:
+            return "measuring..."
+        return "%.1f ticks/s, %d%% busy, %d packets/s | last mesh: %.0f ms convert, %.0f ms write" % (
+            stats["rate"], round(stats["busy"] * 100), stats["packets"],
+            stats["convert"], stats["write"])
 
     def _detail(self):
         counts = self.link.counts

@@ -41,7 +41,7 @@ unfocused window catches up the moment you click back into it.
 | Environment | Nomad's HDRI onto the Toolbag sky, with its rotation, exposure and blur |
 | Lights | sun/point/spot as Toolbag lights: color or kelvin, brightness, cone, shadows |
 | Cameras | Nomad cameras as scene cameras to render through, incl. orthographic |
-| View | Nomad's camera, when **Follow Nomad's view** is ticked (off by default) |
+| View | Nomad's camera, when **Follow Nomad's view** is ticked — the same shared setting Nomad and the Blender add-on call Working View, so it moves for every connected app at once |
 
 Deliberately not mapped:
 

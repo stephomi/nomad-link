@@ -75,6 +75,15 @@ class PanelTest(unittest.TestCase):
         self.panel.on_follow()
         self.assertTrue(self.link.scene.follow_view)
 
+    def test_the_follow_checkbox_shows_the_shared_flag(self):
+        # Nomad (or another bridge) turned the view flag on: the box follows
+        self.link.scene.follow_view = True
+        self.panel.update()
+        self.assertTrue(self.panel.follow.value)
+        self.link.scene.follow_view = False
+        self.panel.update()
+        self.assertFalse(self.panel.follow.value)
+
     def test_connect_button_uses_the_typed_address(self):
         calls = []
         self.link.connect = lambda host, port: calls.append((host, port))

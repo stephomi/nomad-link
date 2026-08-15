@@ -253,7 +253,9 @@ Complete mesh state in one frame.
     "roughness_offset": 440,              // per vertex, 8 × 1 B
     "roughness_format": "uint8_norm",
     "metalness_offset": 448,              // per vertex, 8 × 1 B
-    "metalness_format": "uint8_norm",
+    "metalness_format": "uint8_norm",     //   a channel the sender shades flat (a primitive,
+                                          //   an imported material) fills its array with the
+                                          //   §10 `material` value: shade the vertex data
 
     "base_color_offset": 456,             // un-composited base paint, present only when
     "base_color_format": "rgbm8",         //   the mesh has layers (else base = the
@@ -630,6 +632,9 @@ default.
 
 Send only edited fields. Absent fields are unchanged. The matcap channel is not
 supported. `mesh_full` also has top-level `smooth_shading`.
+
+A `color` / `opacity` / `roughness` / `metalness` edit on a mesh the sender shades flat is
+followed by `mesh_attributes` (§7.3) carrying the new value per vertex.
 
 `light`:
 

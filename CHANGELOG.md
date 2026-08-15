@@ -2,6 +2,15 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.41
+
+- Toolbag: **Follow Nomad's view** is Nomad's shared Working View setting rather than a local
+  one, so ticking it in the plugin turns view sync on for the session, and a change made in
+  Nomad or another bridge shows up in the checkbox.
+- Toolbag: the transfer is faster.
+- A flat material color travels as vertex data: primitives were white in Blender's Shading tab.
+- No protocol change.
+
 ## 0.11.40
 
 - Blender: the connection no longer stalls on "Waiting for Nomad" when another add-on keeps a

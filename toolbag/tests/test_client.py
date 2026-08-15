@@ -5,6 +5,7 @@ import socket
 import struct
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -118,6 +119,51 @@ class ClientTest(unittest.TestCase):
         self.assertTrue(wait(self.link, lambda: obj.mesh.vertices[0] == 5.0))
         self.assertEqual(self.link.counts["updates"], 1)
         self.assertEqual(len(self.objects()), 1)  # patched, not duplicated
+
+    def _delta(self, index, position):
+        header = {"type": "mesh_delta", "mesh_id": "cube", "count": 1, "vertex_count": 8,
+                  "index_offset": 0, "index_format": "uint32", "position_offset": 4,
+                  "position_format": "float32x3", "live_sync": True}
+        return header, struct.pack("<I3f", index, *position)
+
+    def test_a_burst_of_deltas_costs_one_write(self):
+        # Toolbag rebuilds the mesh adjacency on every write, and only the state
+        # the deltas add up to is ever seen
+        self.send_cube()
+        obj = self.objects()[0]
+        writes = []
+        original = self.link.scene.update_geometry
+        self.link.scene.update_geometry = lambda link_id, built: (
+            writes.append(link_id), original(link_id, built))[-1]
+        batch = [self._delta(0, (5.0, 5.0, 5.0)),
+                 self._delta(1, (6.0, 6.0, 6.0)),
+                 self._delta(0, (7.0, 7.0, 7.0))]
+        self.link.connection.poll = lambda batches=[batch]: batches.pop() if batches else []
+        self.link.pump()
+        self.assertEqual(writes, ["cube"])
+        self.assertEqual(self.link.counts["updates"], 3)
+        self.assertEqual(obj.mesh.vertices[0], 7.0)     # the last word on vertex 0
+        self.assertEqual(obj.mesh.vertices[3], 6.0)     # and vertex 1 is not lost
+
+    def test_a_full_mesh_cancels_the_delta_it_arrived_with(self):
+        self.send_cube()
+        writes = []
+        original = self.link.scene.update_geometry
+        self.link.scene.update_geometry = lambda link_id, built: (
+            writes.append(link_id), original(link_id, built))[-1]
+        header, binary = cube()
+        batch = [self._delta(0, (5.0, 5.0, 5.0)), (header, binary)]
+        self.link.connection.poll = lambda batches=[batch]: batches.pop() if batches else []
+        self.link.pump()
+        self.assertEqual(writes, [])        # apply_mesh wrote the whole thing instead
+        self.assertFalse(self.link._dirty)
+
+    def test_the_pump_measures_itself(self):
+        self.link._window = [time.time() - 1.5, 3, 6, 0.3]   # a window ready to close
+        self.link.pump()
+        self.assertGreater(self.link.stats["rate"], 0.0)
+        self.assertGreater(self.link.stats["busy"], 0.0)
+        self.assertEqual(self.link.stats["packets"], 6)
 
     def test_a_delta_for_stale_topology_asks_for_a_full_mesh(self):
         self.send_cube()
@@ -289,6 +335,46 @@ class ClientTest(unittest.TestCase):
                          "source_name": "Nomad iPad"})
         self.assertTrue(wait(self.link, lambda: self.link.session_config.get("revision") == 3))
         self.assertEqual(self.link.session_config["source_name"], "Nomad iPad")
+
+    def test_the_shared_view_flag_drives_camera_following(self):
+        self.nomad.send({"type": "session_config", "revision": 3, "sync_mode": "auto",
+                         "sync_view": True})
+        self.assertTrue(wait(self.link, lambda: self.link.scene.follow_view))
+        self.nomad.send({"type": "session_config", "revision": 4, "sync_mode": "auto",
+                         "sync_view": False})
+        self.assertTrue(wait(self.link, lambda: not self.link.scene.follow_view))
+
+    def test_a_stale_config_echo_does_not_undo_the_current_one(self):
+        self.nomad.send({"type": "session_config", "revision": 7, "sync_mode": "auto",
+                         "sync_view": True})
+        self.assertTrue(wait(self.link, lambda: self.link.scene.follow_view))
+        self.nomad.send({"type": "session_config", "revision": 2, "sync_mode": "auto",
+                         "sync_view": False})
+        self.assertTrue(wait(self.link, lambda: True, seconds=0.3))
+        self.assertTrue(self.link.scene.follow_view)
+        self.assertEqual(self.link.config_revision, 7)
+
+    def test_following_asks_nomad_instead_of_deciding_alone(self):
+        self.nomad.send({"type": "session_config", "revision": 5, "sync_mode": "nomad",
+                         "live_sync": True, "sync_view": False, "sync_objects": True,
+                         "sync_lights": False, "source_name": "Nomad iPad"})
+        self.assertTrue(wait(self.link, lambda: self.link.config_revision == 5))
+        self.link.set_sync_view(True)
+        self.assertTrue(wait(self.link,
+                             lambda: self.nomad.first("set_session_config")[0] is not None))
+        asked = self.nomad.first("set_session_config")[0]
+        self.assertEqual(asked["base_revision"], 5)
+        self.assertTrue(asked["sync_view"])
+        self.assertEqual(asked["sync_mode"], "nomad")   # or Nomad refuses the message
+        self.assertTrue(asked["sync_objects"])          # the other flags travel untouched
+        self.assertFalse(asked["sync_lights"])
+        self.assertTrue(asked["live_sync"])
+        self.assertNotIn("source_name", asked)          # informational, not a setting
+
+    def test_the_checkbox_still_works_before_any_config_arrives(self):
+        self.link.set_sync_view(True)
+        self.assertTrue(self.link.scene.follow_view)
+        self.assertIsNone(self.nomad.first("set_session_config")[0])
 
     def test_a_ping_is_answered(self):
         self.nomad.send({"type": "ping"})

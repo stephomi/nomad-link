@@ -11,7 +11,7 @@ import threading
 import time
 
 
-VERSION = "0.11.40"  # bridge_version the examples report (the extension uses its manifest)
+VERSION = "0.11.41"  # bridge_version the examples report (the extension uses its manifest)
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DISCOVERY = b"NOMAD_LINK_DISCOVER 1"
 MAX_JSON = 50 << 20
