@@ -12,6 +12,7 @@ import uuid
 import numpy
 
 import bpy
+import bmesh
 from bpy.app.handlers import persistent
 from mathutils import Matrix, Vector
 
@@ -74,6 +75,7 @@ activity_watch_running = False
 activity_watch_operator = None
 stale_objects = set()
 stale_requested = {}
+stale_error = ""  # the paused message on screen, retired once nothing is paused
 pairing_wait = False
 force_full_ids = set()
 sent_geometry = set()
@@ -94,12 +96,13 @@ sent_assets = set()  # environment ids whose blob already went to Nomad this ses
 pending_shading = None  # shading config waiting for its environment blob
 world_state = None  # last observed world background, for live change detection
 viewport_shown = set()  # Material Preview settings already pointed at the scene, once per session
+editmode_copy = None  # throwaway mesh the Edit Mode BMesh is read through (see editmode_mesh)
 
 VIEWPORT_SENSOR_WIDTH = 36.0
 VIEWPORT_ZOOM = 2.0
 SAFE_WRITE_MODES = {"OBJECT", "VERTEX_PAINT", "WEIGHT_PAINT", "TEXTURE_PAINT"}
+STROKE_OPERATORS = ("SCULPT_OT_", "PAINT_OT_")  # the modal operators that own a live session
 MODAL_SAFE = {"hello", "pairing_pending", "session_config", "error", "mesh_invalidated"}
-STALE_MESSAGE = "Live geometry paused; it refreshes automatically outside Edit Mode, Dyntopo, and Multires"
 MODIFIER_MESSAGE = "Objects sending their modifier results cannot receive; turn off Send Modifier Results"
 LAYER_DTYPE = numpy.dtype([("index", "<u4"), ("offset", "<f4", 3)])
 
@@ -159,7 +162,7 @@ def claim_blender_source():
     ):
         return
     if stale_objects:
-        connection.error = "Blender sends once the linked meshes finish refreshing"
+        connection.error = stale_error or "Paused: meshes refreshing"
         return
     claim_pending = connection.send({"type": "claim_sync", "source": "client"})
 
@@ -371,6 +374,23 @@ def sends_evaluated(obj):
     return bool(getattr(obj, "modifiers", None)) and bpy.context.scene.nomad_link_send_modifiers
 
 
+def editmode_mesh(obj):
+    """Edit Mode holds the edits in the BMesh and only writes obj.data back when the mode ends:
+    read them out through a copy, reused every send. obj.update_from_editmode() would fill
+    obj.data instead, but it tags the geometry and that depsgraph echo re-queues the very send
+    it came from, forever."""
+    global editmode_copy
+    try:
+        editmode_copy.name  # undo or a file load frees it and leaves the wrapper dangling
+    except (AttributeError, ReferenceError):
+        editmode_copy = bpy.data.meshes.new("Nomad Link Edit Mode")
+    bmesh.from_edit_mesh(obj.data).to_mesh(editmode_copy)
+    # every layer travels, which color attribute is active does not, and that is the one Nomad gets
+    editmode_copy.attributes.active_color_name = obj.data.attributes.active_color_name
+    editmode_copy.attributes.default_color_name = obj.data.attributes.default_color_name
+    return editmode_copy
+
+
 def geometry_write_mode(obj):
     """How obj.data arrays may be written right now: "safe", "sculpt", or None (unsafe)."""
     if obj.mode in SAFE_WRITE_MODES:
@@ -380,6 +400,36 @@ def geometry_write_mode(obj):
     if any(modifier.type == "MULTIRES" for modifier in obj.modifiers):
         return None
     return "sculpt"
+
+
+def pause_stale(mesh_id, obj, fetching=False):
+    """Hold obj's live geometry and name the one thing the user has to undo to get it flowing."""
+    global stale_error
+    # the reason comes first: the panel is narrow and clips the tail
+    if fetching:  # nothing blocks the write any more, the full mesh replacing it is on its way
+        message = f"Refreshing ({obj.name})"
+    else:
+        if obj.mode == "EDIT":
+            reason = "Edit Mode"
+        elif obj.mode == "SCULPT" and obj.use_dynamic_topology_sculpting:
+            reason = "Dyntopo"
+        elif obj.mode == "SCULPT" and any(modifier.type == "MULTIRES" for modifier in obj.modifiers):
+            reason = "Multires"
+        else:
+            reason = "not Object Mode"
+        message = f"Paused: {reason} ({obj.name})"
+    stale_objects.add(mesh_id)
+    stale_error = message
+    connection.error = message
+
+
+def resume_stale(mesh_id):
+    """Drop a mesh from the paused set; the panel message goes once nothing is paused."""
+    global stale_error
+    stale_objects.discard(mesh_id)
+    stale_requested.pop(mesh_id, None)
+    if not stale_objects and connection.error == stale_error:
+        connection.error = stale_error = ""
 
 
 def refresh_sculpt_session(obj):
@@ -1014,8 +1064,9 @@ def receive_mesh(header, binary):
         restore_mode = enter_object_mode(obj)
         if restore_mode is None:
             if header.get("live_sync", False):
-                stale_objects.add(mesh_id)
-            raise RuntimeError("Leave Edit Mode on the linked object to receive the Nomad mesh")
+                pause_stale(mesh_id, obj)  # the message names the mode holding the mesh
+                raise RuntimeError(stale_error)
+            raise RuntimeError(f"Leave Edit Mode to get the mesh ({obj.name})")
     try:
         if obj is None:
             # a known geometry_id names the group's datablock: adopt it, a second one carrying
@@ -1128,8 +1179,7 @@ def receive_mesh(header, binary):
             remember_delta_cache(mesh) # what arrived is the baseline a Blender stroke diffs against
         apply_object_state(obj, header)
         dirty_objects.pop(obj.as_pointer(), None)
-        stale_objects.discard(mesh_id)
-        stale_requested.pop(mesh_id, None)
+        resume_stale(mesh_id)
         if not header.get("live_sync", False):
             bpy.context.view_layer.objects.active = obj
             obj.select_set(True)
@@ -1150,11 +1200,10 @@ def receive_delta(header, binary):
         return
     write_mode = geometry_write_mode(obj)
     if write_mode is None:
-        stale_objects.add(mesh_id)
-        connection.error = STALE_MESSAGE
+        pause_stale(mesh_id, obj)
         return
     if mesh_id in stale_objects:
-        connection.error = "Waiting for a fresh Nomad mesh before applying live updates"
+        pause_stale(mesh_id, obj, fetching=True)
         return
     count = int(header["count"])
     if count < 0 or int(header.get("binary_size", -1)) != len(binary):
@@ -1240,11 +1289,10 @@ def receive_attributes(header, binary):
         return
     write_mode = geometry_write_mode(obj)
     if write_mode is None:
-        stale_objects.add(mesh_id)
-        connection.error = STALE_MESSAGE
+        pause_stale(mesh_id, obj)
         return
     if mesh_id in stale_objects:
-        connection.error = "Waiting for a fresh Nomad mesh before applying live updates"
+        pause_stale(mesh_id, obj, fetching=True)
         return
     vertex_count = int(header["vertex_count"])
     if vertex_count != len(obj.data.vertices) or int(header.get("binary_size", -1)) != len(binary):
@@ -1381,8 +1429,7 @@ def receive_instance(header):
         obj[MESH_ID] = mesh_id
     elif obj.data != source.data:
         if obj.mode != "OBJECT":
-            stale_objects.add(mesh_id)
-            connection.error = STALE_MESSAGE
+            pause_stale(mesh_id, obj)
             return
         if obj.data.shape_keys:
             obj.shape_key_clear()
@@ -1397,8 +1444,7 @@ def receive_instance(header):
     apply_object_state(obj, header)
     sent_geometry.add(header.get("geometry_id", ""))
     dirty_objects.pop(obj.as_pointer(), None)
-    stale_objects.discard(mesh_id)
-    stale_requested.pop(mesh_id, None)
+    resume_stale(mesh_id)
 
 
 def receive_camera(header):
@@ -1865,7 +1911,9 @@ def remember_delta_cache(mesh):
 
 def encode_object(obj, live=False, include_material=True, replace_topology=False):
     if not sends_evaluated(obj):
-        return encode_mesh(obj, obj.data, live, include_material, replace_topology)
+        source = editmode_mesh(obj) if obj.mode == "EDIT" else obj.data
+        return encode_mesh(obj, source, live, include_material, replace_topology)
+    # the evaluated mesh already runs the stack on the edit BMesh: it needs no copy of its own
     evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
     try:
         mesh = evaluated.to_mesh() or obj.data  # a stack that yields no mesh falls back to the base
@@ -2317,8 +2365,8 @@ def replace_scene_objects(scene):
     pending_transfers.clear()
     pending_objects.clear()
     pending_materials.clear()
-    stale_objects.clear()
-    stale_requested.clear()
+    for mesh_id in tuple(stale_objects):
+        resume_stale(mesh_id)  # the removed objects take their paused message with them
     delta_cache.clear()
     deferred_parents.clear()
     sent_geometry.clear()
@@ -2730,8 +2778,7 @@ def receive_delete(header):
         known_objects.pop(node.as_pointer(), None)
         dirty_objects.pop(node.as_pointer(), None)
         deferred_parents.pop(node_id, None)
-        stale_objects.discard(node_id)
-        stale_requested.pop(node_id, None)
+        resume_stale(node_id)
         bpy.data.objects.remove(node, do_unlink=True)
 
 
@@ -3053,7 +3100,8 @@ def poll_membership():
         current[pointer] = (obj.get(MESH_ID, ""), obj.type)
         if known_objects.get(pointer) != current[pointer]:
             changed.append(pointer)
-    stale_objects.intersection_update(link_id for link_id, _kind in current.values() if link_id)
+    for gone in stale_objects.difference(link_id for link_id, _kind in current.values() if link_id):
+        resume_stale(gone)  # a deleted object keeps neither its pause nor its message
     if connection.status != "Connected" or not wants_blender_source(scene):
         known_objects = current
         membership_ready = True
@@ -3092,10 +3140,15 @@ def poll_membership():
 
 
 def modal_operator_running():
-    """True while a brush stroke, transform, or any other modal operator is in flight."""
+    """True while a brush stroke owns the session a received packet would rewrite. Only
+    Blender's own sculpt and paint strokes hold one, so they are named rather than excepted:
+    an add-on that keeps a modal listener open all session must never hold the link."""
+    obj = bpy.context.object
+    if obj is None or obj.mode in SAFE_WRITE_MODES:
+        return False
     for window in bpy.context.window_manager.windows:
         for operator in getattr(window, "modal_operators", ()):
-            if operator.bl_idname != "NOMAD_OT_activity_watch":
+            if operator.bl_idname.startswith(STROKE_OPERATORS):
                 return True
     return False
 
@@ -3118,7 +3171,8 @@ def queue_dirty(obj, flag, delay):
 def undo_redo_post(scene, _depsgraph=None):
     """Undo frees and rebuilds datablocks: the queued objects and the pointer keys of
     known_objects/visibility_states dangle, and a reused pointer would resolve to a dead entry."""
-    global membership_ready
+    global membership_ready, editmode_copy
+    editmode_copy = None  # a zero-user datablock does not survive the memfile it is restored from
     dirty_objects.clear()
     known_objects.clear()
     visibility_states.clear()
@@ -3637,7 +3691,7 @@ class NOMAD_PT_link(bpy.types.Panel):
             layout.label(text=connection.error, icon="ERROR")
         if deferred_packets:
             layout.label(
-                text=f"{len(deferred_packets)} updates held while a modal operator runs",
+                text=f"{len(deferred_packets)} updates held until the brush stroke ends",
                 icon="INFO",
             )
         if update_required:

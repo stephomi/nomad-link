@@ -2,6 +2,18 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.42
+
+- Blender: Edit Mode changes reach Nomad while you make them. Blender keeps those edits in its
+  own mesh until the mode ends, so until now they only travelled once you went back to Object
+  Mode.
+- Blender: an add-on that keeps a modal operator open for the whole session no longer freezes
+  the link. Updates are only held while a sculpt or paint brush stroke is in flight, the one
+  case where applying them could crash Blender.
+- Blender: the panel says which mesh paused and why — Edit Mode, Dyntopo or Multires — and
+  drops the message once it has caught up.
+- No protocol change.
+
 ## 0.11.41
 
 - Toolbag: **Follow Nomad's view** is Nomad's shared Working View setting rather than a local
