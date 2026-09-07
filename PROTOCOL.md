@@ -951,7 +951,7 @@ the file bytes, so the same image on both devices never travels.
 
 ### 10.4 `repeater` — procedural copies
 
-A Nomad repeater (array, curve, mirror, radial) travels as the `group` that carries it,
+A Nomad repeater (array, curve, mirror, radial, surface) travels as the `group` that carries it,
 with its config attached. Unlike a primitive (§7.1.2) it has no baked form to fall back
 on: the copies it makes are derived state that Nomad itself never stores, so the config
 *is* the object.
@@ -959,7 +959,7 @@ on: the copies it makes are derived state that Nomad itself never stores, so the
 ```jsonc
 "repeater": {
     "format": 1,          // lowest revision that can read this block; ignore it above yours
-    "type": "array",      // array | curve | mirror | radial, or "group" = not a repeater
+    "type": "array",      // array | curve | mirror | radial | surface, or "group" = not a repeater
     "config": { }         // opaque: Nomad's own serialization
 }
 ```

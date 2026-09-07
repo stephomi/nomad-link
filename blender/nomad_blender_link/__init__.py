@@ -22,6 +22,7 @@ from .transport import Connection, discover, DEFAULT_CAPABILITIES
 
 
 PROTOCOL_VERSION = 1
+DEFAULT_PORT = 48312
 PACKAGE_ID = "nomad_blender_link"
 VERSION = tomllib.loads((Path(__file__).resolve().parent / "blender_manifest.toml").read_text())["version"]
 # stamped at import from the file's mtime: if the panel shows an older time than your last
@@ -3458,7 +3459,7 @@ class NomadLinkPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     host: bpy.props.StringProperty(name="Host", default="127.0.0.1")
-    port: bpy.props.IntProperty(name="Port", default=48312, min=1024, max=65535)
+    port: bpy.props.IntProperty(name="Port", default=DEFAULT_PORT, min=1024, max=65535)
     pair_token: bpy.props.StringProperty(name="Pairing Token", default="", options={"HIDDEN"})
 
     def draw(self, _context):
@@ -3532,6 +3533,18 @@ class NOMAD_OT_reset_host(bpy.types.Operator):
         prefs = preferences()
         if prefs is not None:
             prefs.host = "127.0.0.1"
+        return {"FINISHED"}
+
+
+class NOMAD_OT_reset_port(bpy.types.Operator):
+    bl_idname = "nomad.reset_port"
+    bl_label = "Default Port"
+    bl_description = f"Reset the port to {DEFAULT_PORT}, the port Nomad listens on"
+
+    def execute(self, _context):
+        prefs = preferences()
+        if prefs is not None:
+            prefs.port = DEFAULT_PORT
         return {"FINISHED"}
 
 
@@ -3735,7 +3748,9 @@ class NOMAD_PT_link(bpy.types.Panel):
             row.prop(prefs, "host")
             row.operator("nomad.reset_host", text="", icon="HOME")
             row.operator("nomad.discover", text="", icon="VIEWZOOM")
-            layout.prop(prefs, "port")
+            row = layout.row(align=True)
+            row.prop(prefs, "port")
+            row.operator("nomad.reset_port", text="", icon="LOOP_BACK")
             row = layout.row()
             row.scale_y = 1.4
             row.operator("nomad.connect", icon="LINKED")
@@ -4188,6 +4203,7 @@ classes = (
     NOMAD_OT_forget_pairing,
     NOMAD_OT_activity_watch,
     NOMAD_OT_reset_host,
+    NOMAD_OT_reset_port,
     NOMAD_OT_discover,
     NOMAD_OT_connect,
     NOMAD_OT_listen,
