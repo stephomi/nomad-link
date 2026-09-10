@@ -136,6 +136,46 @@ def test_transform():
     check(numpy.allclose(back, CUBE_POINTS), "inverse transform returns the original")
 
 
+
+
+def test_sculpt_layers():
+    """A posed mesh: positions are the base, layers carry the deltas."""
+    import struct
+    points = numpy.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], "<f4")
+    binary = bytearray(points.tobytes())
+    binary += numpy.array([0, 1, 2], "<i4").tobytes()   # one triangle, corners
+    sizes_offset = len(binary)
+    binary += numpy.array([3], "<i4").tobytes()
+    # two sparse records: vertex 1 up by 1, vertex 2 up by 2
+    layer_offset = len(binary)
+    binary += struct.pack("<I3f", 1, 0.0, 1.0, 0.0) + struct.pack("<I3f", 2, 0.0, 2.0, 0.0)
+    hidden_offset = len(binary)
+    binary += struct.pack("<I3f", 0, 99.0, 99.0, 99.0)
+
+    header = {
+        "type": "mesh_full", "mesh_id": "posed", "geometry_id": "g", "name": "Posed",
+        "vertex_count": 3, "face_count": 1, "position_offset": 0,
+        "face_format": "corners", "corner_count": 3, "corner_vertex_offset": 36,
+        "face_size_offset": sizes_offset,
+        "layers": [
+            {"name": "Pose", "factor": 0.5, "factor_offset": 1.0, "visible": True,
+             "visible_offset": True, "offset": layer_offset, "count": 2,
+             "format": "uint32_float32x3"},
+            {"name": "Muted", "factor": 1.0, "visible": False, "visible_offset": True,
+             "offset": hidden_offset, "count": 1, "format": "uint32_float32x3"},
+        ],
+    }
+    mesh = convert.decode_mesh(header, bytes(binary))
+    check(len(mesh["layers"]) == 2, "both layers decoded")
+    check(mesh["layers_applied"] == 1, "only the visible layer is applied")
+    check(numpy.allclose(mesh["positions"][1], [1, 0.5, 0]),
+          "base plus delta scaled by factor x factor_offset: %s" % mesh["positions"][1])
+    check(numpy.allclose(mesh["positions"][2], [2, 1.0, 0]), "every record in the layer applies")
+    check(numpy.allclose(mesh["positions"][0], [0, 0, 0]), "a muted layer changes nothing")
+    check(numpy.allclose(mesh["base_positions"][1], [1, 0, 0]),
+          "the un-posed base is kept alongside")
+
+
 if __name__ == "__main__":
     for name, function in sorted(globals().items()):
         if name.startswith("test_"):

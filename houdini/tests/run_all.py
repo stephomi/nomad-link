@@ -12,7 +12,14 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULES = ["test_convert.py", "test_link.py", "test_nodes.py"]
+MODULES = ["test_convert.py", "test_link.py", "test_nodes.py", "test_hierarchy.py"]
+
+try:
+    import pxr  # noqa: F401
+    MODULES.append("test_usd.py")
+    MODULES.append("test_openpbr.py")
+except ImportError:
+    print("no pxr: skipping test_usd.py\n")
 
 try:
     import hou  # noqa: F401

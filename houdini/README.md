@@ -90,6 +90,24 @@ send is a full mesh, which is one undo step in Nomad. The capabilities in the
 
 ## Troubleshooting
 
+**A transfer stops part-way.** Two things reliably cause this, both measured
+against Nomad 2.9.25:
+
+- *Another client is connected.* Peers share Nomad's sender, and a stalled or
+  lingering one holds up everybody -- including a dead session Nomad has not
+  reaped. `nomad_link.report()` lists them under `other peers`; restarting
+  Nomad's Link host clears them.
+- *Something was sent mid-transfer.* A request while a scene is streaming makes
+  Nomad restart it from the beginning, so anything we ask for waits for a
+  properly quiet link.
+
+With one client and a quiet link, a 412-object, 180 MB scene arrives untouched.
+Interacting with Nomad also appeared to resume a stalled transfer, but that was
+observed while the other two problems were still present and has not been
+confirmed since. `demo/probe.py` reproduces a transfer with no Houdini involved
+if you need to tell the two apart.
+
+
 **`Permission denied` copying the package file (macOS).** The Houdini installer
 runs as root and can leave the preferences folder owned by root, so your user
 cannot write into it. Give it back to yourself, then copy again:

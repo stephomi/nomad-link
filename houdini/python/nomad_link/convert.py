@@ -95,6 +95,42 @@ def corners_to_quads(sizes, *arrays):
     return stacked, mapping
 
 
+# --------------------------------------------------------------- sculpt layers
+
+# sparse per-vertex records: (vertex index, xyz offset)
+LAYER_DTYPE = numpy.dtype([("index", "<u4"), ("offset", "<f4", 3)])
+
+
+def decode_layers(header, binary):
+    """The `layers` array of mesh_full (PROTOCOL.md 7.1), records included."""
+    layers = []
+    for entry in header.get("layers", ()):
+        weight = float(entry.get("factor", 1.0)) * float(entry.get("factor_offset", 1.0))
+        layer = {
+            "name": str(entry.get("name", "layer")),
+            "weight": weight,
+            "visible": bool(entry.get("visible", True)) and bool(entry.get("visible_offset", True)),
+            "count": int(entry.get("count", 0)),
+        }
+        if "offset" in entry and layer["count"]:
+            records = numpy.frombuffer(binary, LAYER_DTYPE, layer["count"], int(entry["offset"]))
+            layer["indices"] = records["index"].astype(numpy.int64)
+            layer["offsets"] = numpy.array(records["offset"], numpy.float32)
+        layers.append(layer)
+    return layers
+
+
+def apply_layers(positions, layers):
+    """final position = base + sum of weight x offset, over visible layers."""
+    applied = 0
+    for layer in layers:
+        if not layer["visible"] or "indices" not in layer or layer["weight"] == 0.0:
+            continue
+        positions[layer["indices"]] += layer["offsets"] * layer["weight"]
+        applied += 1
+    return applied
+
+
 # ------------------------------------------------------------------- decoding
 
 def decode_mesh(header, binary):
@@ -106,7 +142,16 @@ def decode_mesh(header, binary):
         "geometry_id": header.get("geometry_id", ""),
         "name": header.get("name", "nomad"),
         "world_matrix": list(header.get("world_matrix", IDENTITY)),
+        # 0.11.37 hierarchy: absent parent_id means "leave parenting alone", which
+        # is not the same as "" (the scene root), so absence is kept as None
+        "parent_id": header.get("parent_id"),
+        "child_index": header.get("child_index"),
+        "locked": bool(header.get("locked", False)),
         "smooth_shading": bool(header.get("smooth_shading", True)),
+        # when parent_id is set these are the parent's world and the local
+        # transform relative to it; prefer them over the flattened world_matrix
+        "local_matrix": header.get("local_matrix"),
+        "world_matrix_parent": header.get("world_matrix_parent"),
         "positions": _read(binary, header["position_offset"], count * 3, "<f4").reshape(-1, 3).copy(),
     }
     if "visible" in header:  # absent leaves the cached flag alone (client._store)
@@ -141,6 +186,15 @@ def decode_mesh(header, binary):
             continue
         dtype = "u2" if scale > 255.0 else "u1"
         mesh[houdini_name] = _read(binary, offset, count, dtype).astype(numpy.float32) / scale
+
+    # positions in mesh_full are the BASE: sculpt layers carry sparse deltas that
+    # the client applies, which is why a posed character arrives unposed without
+    # this. Paint is the other way round -- the plain channels are already
+    # composited, and base_* holds the un-composited version.
+    mesh["layers"] = decode_layers(header, binary)
+    if mesh["layers"]:
+        mesh["base_positions"] = mesh["positions"].copy()
+        mesh["layers_applied"] = apply_layers(mesh["positions"], mesh["layers"])
 
     if "face_group_offset" in header:
         mesh["face_group"] = _read(binary, header["face_group_offset"], faces, "<u2").astype(numpy.int32)
@@ -269,7 +323,8 @@ def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
     if groups is not None:
         header["face_group_offset"] = len(binary)
         header["face_group_format"] = "uint16"
-        binary.extend(numpy.clip(groups, 0, 65535).astype("<u2").tobytes())
+        # uint16 on the wire, but 0.11.36 documents ids as <= 32767
+        binary.extend(numpy.clip(groups, 0, 32767).astype("<u2").tobytes())
         header["face_groups"] = [{"name": str(n)} for n in face_group_names]
     if hidden is not None:
         header["face_hidden_offset"] = len(binary)
@@ -283,6 +338,32 @@ def encode_mesh(*, mesh_id, geometry_id, name, positions, sizes, corners,
 def _pack_unit(values, scale, dtype):
     unit = numpy.clip(numpy.asarray(values, numpy.float32), 0.0, 1.0)
     return numpy.round(unit * scale).astype(dtype)
+
+
+def compose_local(child, parent):
+    """child world matrix relative to parent world matrix, both column-major 16.
+
+    Nomad sends world matrices. Nesting prims under a parent means the parent's
+    transform applies too, so the child has to carry only the difference.
+    """
+    child_m = numpy.array(child, numpy.float64).reshape(4, 4, order="F")
+    parent_m = numpy.array(parent, numpy.float64).reshape(4, 4, order="F")
+    local = numpy.linalg.inv(parent_m) @ child_m
+    return list(local.flatten(order="F"))
+
+
+def multiply(parent, local):
+    """world = parent x local, in Nomad's column-major column-vector convention."""
+    parent_m = numpy.array(parent, numpy.float64).reshape(4, 4, order="F")
+    local_m = numpy.array(local, numpy.float64).reshape(4, 4, order="F")
+    return list((parent_m @ local_m).flatten(order="F"))
+
+
+def matrices_close(a, b, tolerance=1e-4):
+    if a is None or b is None:
+        return False
+    return bool(numpy.allclose(numpy.array(a, numpy.float64),
+                               numpy.array(b, numpy.float64), atol=tolerance))
 
 
 def transform_points(positions, matrix, inverse=False):

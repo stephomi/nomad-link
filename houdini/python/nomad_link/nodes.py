@@ -8,6 +8,7 @@ Cook-relevant parameters live on the inner Python SOP as channel references to
 the asset (see build_hda.py) so Houdini tracks them as real cook dependencies;
 everything else is read from the asset node.
 """
+import time
 import uuid
 
 import hou
@@ -18,6 +19,7 @@ from .client import DEFAULT_PORT, client
 
 IN_TYPE = "nomad_link_in"
 OUT_TYPE = "nomad_link_out"
+IMPORT_TYPE = "nomad_link_import"  # LOP: the whole scene onto a USD stage
 ID_NAMESPACE = uuid.UUID("6f9c1f2a-0e3d-4f1b-9a77-1a2b3c4d5e6f")
 
 # helper attributes the HDA's wrangles create, so topology reads as flat arrays
@@ -31,9 +33,13 @@ CHANNELS = (("Cd", "color", 3), ("Alpha", "alpha", 1), ("rough", "rough", 1),
 
 # ------------------------------------------------------------------ utilities
 
-def _instances(type_name):
-    node_type = hou.nodeType(hou.sopNodeTypeCategory(), type_name)
+def _instances(type_name, category=None):
+    node_type = hou.nodeType(category or hou.sopNodeTypeCategory(), type_name)
     return node_type.instances() if node_type else ()
+
+
+def _import_lops():
+    return _instances(IMPORT_TYPE, hou.lopNodeTypeCategory())
 
 
 def _eval(node, name, default=0):
@@ -61,19 +67,33 @@ def _set_attrib(geo, kind, name, values, size, default=0.0, integer=False):
 
 def status_text():
     link = client()
+    if link.receiving:
+        # no total is on the wire, so count what has arrived rather than invent one
+        quiet = link.quiet_for()
+        return "Receiving: %d objects...%s" % (
+            link.object_count,
+            "  (nothing for %ds -- see nomad_link.report())" % quiet if quiet > 5.0 else "")
+    if link.connected and link.object_count:
+        return "%s - %s (%d objects)" % (link.status, link.message, link.object_count)
     return "%s - %s" % (link.status, link.message)
 
 
+def refresh_status():
+    """Just the status field: cheap, and no cook depends on it."""
+    text = status_text()
+    for node in list(_instances(IN_TYPE)) + list(_instances(OUT_TYPE)) + list(_import_lops()):
+        parm = node.parm("status")
+        if parm is not None and parm.evalAsString() != text:
+            parm.set(text)
+
+
 def refresh_inputs(revision):
-    """Called from the pump when the cache changed: dirty every In SOP."""
-    for node in _instances(IN_TYPE):
+    """Called from the pump when the cache changed: dirty every reading node."""
+    for node in list(_instances(IN_TYPE)) + list(_import_lops()):
         parm = node.parm("revision")
         if parm is not None and parm.eval() != revision:
             parm.set(revision)
-    for node in list(_instances(IN_TYPE)) + list(_instances(OUT_TYPE)):
-        parm = node.parm("status")
-        if parm is not None and parm.evalAsString() != status_text():
-            parm.set(status_text())
+    refresh_status()
 
 
 def store_mesh_id(node_path, mesh_id):
@@ -107,11 +127,26 @@ def disconnect_button(kwargs):
     refresh_inputs(client().revision)
 
 
+def enable_sync(kwargs):
+    """Turn on every live channel Nomad is currently withholding."""
+    client().set_session(live_sync=True, sync_objects=True, sync_lights=True,
+                         sync_materials=True, sync_cameras=True)
+
+
+def clear_button(kwargs):
+    """Forget the cached scene: Nomad has moved on to a different project."""
+    client().clear()
+    refresh_inputs(client().revision)
+
+
 def get_selection(kwargs):
     client().request("request_selection")
 
 
 def get_scene(kwargs):
+    # a scene transfer is a replacement, not a merge: without this, objects
+    # deleted in Nomad linger here forever because nothing announces them
+    client().clear_scene()
     client().request("request_scene")
 
 
@@ -123,6 +158,7 @@ def send_button(kwargs):
 # --------------------------------------------------------------- In SOP (read)
 
 def cook_in(sop):
+    started = time.time()
     geo = sop.geometry()
     link = client()
     _eval(sop, "revision")  # cook dependency: new Nomad data bumps this
@@ -211,6 +247,7 @@ def cook_in(sop):
 
     geo.addAttrib(hou.attribType.Global, "nomad_mesh_ids", "")
     geo.setGlobalAttribValue("nomad_mesh_ids", " ".join(m["mesh_id"] for m in meshes))
+    link.record_cook(time.time() - started)
 
 
 def _create_points(geo, positions):
@@ -248,6 +285,44 @@ def _face_channel(geo, meshes, key, attrib, offset_ids=False):
             base += max(len(mesh.get("face_group_names", ())), int(indices.max()) + 1 if count else 0)
     _set_attrib(geo, hou.attribType.Prim, attrib,
                 numpy.concatenate(values), 1, 0.0, integer=True)
+
+
+# -------------------------------------------------------- Import LOP (Solaris)
+
+def cook_import(lop):
+    """Author the whole Nomad scene -- meshes, materials, lights, cameras -- on a stage."""
+    from . import usd  # only the LOP side needs pxr
+
+    link = client()
+    # surface per-object failures through report() rather than only stdout
+    def _note(problems):
+        # hundreds of identical lines bury everything else in the log
+        seen = []
+        for problem in problems:
+            if problem not in seen:
+                seen.append(problem)
+        for problem in seen[:3]:
+            link.note("authoring: %s" % problem)
+        if len(problems) > len(seen[:3]):
+            link.note("authoring: ...and %d more like it" % (len(problems) - len(seen[:3])))
+
+    usd.report_problems = _note
+
+    _eval(lop, "revision")  # cook dependency: new Nomad data bumps this
+    started = time.time()
+    usd.author_scene(
+        lop.editableStage(),
+        client(),
+        scale=_eval(lop, "scale", 1.0) or 1.0,
+        import_materials=bool(_eval(lop, "importmaterials", 1)),
+        import_lights=bool(_eval(lop, "importlights", 1)),
+        import_cameras=bool(_eval(lop, "importcameras", 1)),
+        import_environment=bool(_eval(lop, "importenv", 1)),
+        environment_path=hou.text.expandString(_eval(lop, "envpath", "") or ""),
+        light_scale=_eval(lop, "lightscale", 1.0),
+        material_style=_eval(lop, "matstyle", "openpbr") or "openpbr",
+    )
+    link.record_cook(time.time() - started)
 
 
 # -------------------------------------------------------------- Out SOP (write)
