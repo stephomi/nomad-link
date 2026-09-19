@@ -94,6 +94,9 @@ def in_parm_group():
                 "Ask Nomad for its current selection."),
          button("getscene", "Get Scene", "get_scene",
                 "Ask Nomad for every object in the scene."),
+         button("clear", "Clear Cache", "clear_button",
+                "Forget everything received so far. The cache is shared by the "
+                "session, so deleting the node does not reset it."),
          source]
         + transform_parms("Nomad (glTF) is counter-clockwise front-facing, Houdini is clockwise.")
         + [toggle("importuv", "Import UVs", True),
@@ -131,6 +134,73 @@ def out_parm_group():
         folder_type=hou.folderType.Simple,
     ))
     return group
+
+
+def import_parm_group():
+    """The Solaris side: the whole Nomad scene onto a stage."""
+    group = hou.ParmTemplateGroup()
+    group.append(connection_folder())
+
+    scale = hou.FloatParmTemplate("scale", "Scale", 1, default_value=(1.0,), min=0.001, max=100.0)
+    scale.setHelp("Uniform scale applied to positions and transforms.")
+    light_scale = hou.FloatParmTemplate("lightscale", "Light Intensity Scale", 1,
+                                        default_value=(1.0,), min=0.0, max=100.0)
+    light_scale.setHelp("Nomad's light strengths are not in Karma's units; tune here.")
+
+    env_path = hou.StringParmTemplate("envpath", "Environment Search Path", 1,
+                                      default_value=("",),
+                                      string_type=hou.stringParmType.FileReference)
+    env_path.setHelp("Nomad names its HDRI (env_name) but does not send the pixels. "
+                     "Point this at a folder holding that file and the DomeLight gets "
+                     "its texture; several folders can be separated by a colon.")
+
+    style = hou.StringParmTemplate(
+        "matstyle", "Material Style", 1, default_value=("openpbr",),
+        menu_items=("openpbr", "preview"),
+        menu_labels=("MaterialX OpenPBR", "UsdPreviewSurface"),
+    )
+    style.setHelp("OpenPBR covers subsurface, refraction and paint compositing that "
+                  "UsdPreviewSurface cannot express. Preview surface is more portable.")
+
+    group.append(hou.FolderParmTemplate(
+        "import", "Import",
+        [button("getsel", "Get Selection", "get_selection",
+                "Ask Nomad for its current selection."),
+         button("getscene", "Get Scene", "get_scene",
+                "Ask Nomad for every object in the scene."),
+         button("clear", "Clear Cache", "clear_button",
+                "Forget everything received so far. The cache is shared by the "
+                "session, so deleting the node does not reset it -- use this after "
+                "loading a different project in Nomad."),
+         button("enablesync", "Enable All Sync Channels", "enable_sync",
+                "Nomad ships with sync_lights and sync_materials off, so those "
+                "edits only arrive on an explicit Get Scene until this is set."),
+         toggle("importmaterials", "Import Materials", True,
+                "Nomad's material block, with its textures."),
+         style,
+         toggle("importlights", "Import Lights", True),
+         toggle("importcameras", "Import Cameras", True),
+         toggle("importenv", "Import Environment", True,
+                "Nomad's environment as a UsdLux DomeLight."),
+         env_path,
+         scale, light_scale],
+        folder_type=hou.folderType.Simple,
+    ))
+    group.append(hidden(hou.IntParmTemplate("revision", "Revision", 1, default_value=(0,))))
+    return group
+
+
+def build_import(container):
+    subnet = container.createNode("subnet", "nomad_link_import")
+    for child in subnet.children():
+        child.destroy()
+    build = subnet.createNode("pythonscript", "build")
+    build.parm("python").set("import nomad_link\nnomad_link.cook_import(hou.pwd())\n")
+    output = subnet.createNode("output", "output0")
+    output.setInput(0, build)
+    output.setDisplayFlag(True)
+    subnet.layoutChildren()
+    return subnet, build
 
 
 def wrangle(parent, name, class_index, snippet):
@@ -234,6 +304,12 @@ def main():
     make_asset(subnet, "send", "nomad_link_out", "Nomad Link Out", out_parm_group(),
                ("autosend", "applyxform", "reverse", "scale", "senduv", "sendcolor"), 1, 1,
                events={"OnLoaded": OUT_ON_LOADED})
+
+    stage = hou.node("/stage")
+    subnet, build = build_import(stage)
+    make_asset(subnet, "build", "nomad_link_import", "Nomad Link Import", import_parm_group(),
+               ("revision", "scale", "lightscale", "importmaterials", "importlights",
+                "importcameras", "importenv", "matstyle", "envpath"), 0, 1)
 
     container.destroy()
     hou.hda.installFile(HDA_FILE)

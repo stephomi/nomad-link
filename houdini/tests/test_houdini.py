@@ -94,7 +94,9 @@ check(wait(link, lambda: link.connected and link.nomad_version == "2.0"),
 # ---------------------------------------------------------------- Nomad -> Houdini
 nomad.send(*nomad_quad_and_tri())
 check(wait(link, lambda: "m1" in link.meshes), "mesh_full lands in the cache")
-check(node_in.evalParm("revision") > 0, "the In SOP's revision parm was bumped")
+# the refresh is coalesced, so it lands a pump or two after the data does
+check(wait(link, lambda: node_in.evalParm("revision") > 0),
+      "the In SOP's revision parm was bumped")
 
 geo = node_in.geometry()
 check(len(geo.points()) == 5, "In built 5 points, got %d" % len(geo.points()))
@@ -123,9 +125,9 @@ nomad.send({"type": "mesh_delta", "mesh_id": "m1", "count": 1, "vertex_count": 5
             "binary_size": 16, "live_sync": True},
            numpy.array([0], "<u4").tobytes() + moved.tobytes())
 check(wait(link, lambda: link.revision > revision), "mesh_delta arrives")
-position = node_in.geometry().points()[0].position()
-check(abs(position[1] - 17.0) < 1e-4,
-      "the In SOP recooked from the delta (y=%.3f, expected 17)" % position[1])
+check(wait(link, lambda: abs(node_in.geometry().points()[0].position()[1] - 17.0) < 1e-4),
+      "the In SOP recooked from the delta (y=%.3f, expected 17)"
+      % node_in.geometry().points()[0].position()[1])
 
 # ---------------------------------------------------------------- Houdini -> Nomad
 box = container.createNode("box")
@@ -168,6 +170,125 @@ nomad.send({"type": "mesh_ack", "mesh_id": "nomad_side_id", "request_id": "req9"
 check(wait(link, lambda: node_out.evalParm("meshid") == "nomad_side_id"),
       "mesh_ack stores Nomad's mesh id on the node")
 
+# ---------------------------------------------------------------- Solaris (LOPs)
+check(hou.nodeType(hou.lopNodeTypeCategory(), "nomad_link_import") is not None,
+      "nomad_link_import is installed as a LOP")
+lop = hou.node("/stage").createNode("nomad_link_import")
+
+nomad.send({"type": "material", "mesh_id": "m1", "material": {
+    "color": [0.8, 0.1, 0.1], "roughness": 0.35, "metalness": 0.0}})
+nomad.send({"type": "light", "link_id": "l1", "name": "Key", "light_type": "spot",
+            "color": [1.0, 0.9, 0.8], "power": 40.0, "spot_angle": 1.0,
+            "world_matrix": list(convert.IDENTITY)})
+camera_matrix = list(convert.IDENTITY)
+camera_matrix[14] = 12.0
+nomad.send({"type": "camera_object", "link_id": "c1", "name": "Shot", "fov_y": 35.0,
+            "world_matrix": camera_matrix})
+check(wait(link, lambda: link.materials and link.lights and link.cameras),
+      "the scene objects reach the cache")
+
+from pxr import UsdGeom, UsdLux, UsdShade  # noqa: E402
+
+usd_stage = lop.stage()
+paths = [p.GetPath().pathString for p in usd_stage.Traverse()]
+check("/nomad/Sculpt" in paths, "the mesh is on the stage: %s" % paths)
+usd_mesh = UsdGeom.Mesh(usd_stage.GetPrimAtPath("/nomad/Sculpt"))
+check(list(usd_mesh.GetFaceVertexCountsAttr().Get()) == [4, 3], "quad survives into USD")
+check(list(usd_mesh.GetFaceVertexIndicesAttr().Get()) == [0, 1, 2, 3, 1, 4, 2],
+      "USD keeps Nomad's winding, unlike the SOP path")
+translation = UsdGeom.Xformable(usd_mesh).GetLocalTransformation().ExtractTranslation()
+check(abs(translation[1] - 10.0) < 1e-5, "the world_matrix became the prim transform")
+check(abs(usd_mesh.GetPointsAttr().Get()[0][1] - 7.0) < 1e-4,
+      "the live delta is in the USD points too")
+check(len(UsdGeom.Subset.GetAllGeomSubsets(usd_mesh)) == 2, "face groups became GeomSubsets")
+
+bound = UsdShade.MaterialBindingAPI(usd_mesh.GetPrim()).GetDirectBinding().GetMaterial()
+check(bool(bound), "a material is bound to the mesh")
+# the LOP defaults to MaterialX OpenPBR, which is what Karma wants
+surface = UsdShade.Shader(usd_stage.GetPrimAtPath(bound.GetPath().pathString + "/OpenPBR"))
+check(surface.GetIdAttr().Get() == "ND_open_pbr_surface_surfaceshader",
+      "the material is an OpenPBR surface")
+check(abs(surface.GetInput("specular_roughness").Get() - 0.35) < 1e-6,
+      "material values reached USD")
+check(bool(bound.GetSurfaceOutput("mtlx").GetConnectedSource()),
+      "bound on the mtlx render context")
+check(bool(UsdLux.SphereLight(usd_stage.GetPrimAtPath("/nomad/Key"))), "the spot light is a prim")
+check(bool(UsdGeom.Camera(usd_stage.GetPrimAtPath("/nomad/Shot"))), "the camera is a prim")
+
+# an instance must share the original's material, not lose it
+instance_matrix = list(convert.IDENTITY)
+instance_matrix[12] = 5.0
+nomad.send({"type": "mesh_instance", "mesh_id": "m1-copy", "geometry_id": "g1",
+            "name": "Sculpt Copy", "visible": True, "world_matrix": instance_matrix,
+            "live_sync": False})
+check(wait(link, lambda: "m1-copy" in link.meshes), "the instance arrives")
+# rebuilds are coalesced, so wait for the stage to catch up rather than assume
+check(wait(link, lambda: bool(lop.stage().GetPrimAtPath("/nomad/Sculpt_Copy"))),
+      "the instance is on the stage")
+copied = lop.stage()
+copy_prim = copied.GetPrimAtPath("/nomad/Sculpt_Copy")
+copy_material = UsdShade.MaterialBindingAPI(copy_prim).GetDirectBinding().GetMaterial()
+check(bool(copy_material), "the instance has a material bound")
+check(copy_material.GetPath() == bound.GetPath(),
+      "and it is the original's material, not a bare one: %s vs %s"
+      % (copy_material.GetPath(), bound.GetPath()))
+materials_scope = copied.GetPrimAtPath("/nomad/Materials")
+check(len(list(materials_scope.GetChildren())) == 1,
+      "one material is authored for both, not one per instance")
+
+# a texture: blob -> disk -> the material's image node (PROTOCOL.md 10.2)
+PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+       b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+       b"\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82")
+nomad.send({"type": "material", "mesh_id": "m1", "material": {
+    "textures": {"color": {"texture_id": "tex-e2e", "name": "skin.png",
+                           "wrap_s": "clamp", "scale": [2.0, 1.0]}}}})
+# requests are held until the link has been properly quiet, since asking during
+# a transfer makes Nomad restart it
+check(wait(link, lambda: any(h.get("type") == "request_texture" for h, _ in nomad.received), 14.0),
+      "an unseen texture id is requested once the link is quiet")
+nomad.send({"type": "texture", "texture_id": "tex-e2e", "name": "skin.png",
+            "binary_size": len(PNG)}, PNG)
+check(wait(link, lambda: "tex-e2e" in link.textures), "the blob arrives and is cached")
+cached = link.textures["tex-e2e"]["path"]
+check(os.path.isfile(cached) and open(cached, "rb").read() == PNG,
+      "the image file is on disk byte for byte: %s" % cached)
+
+def find_image():
+    for prim in lop.stage().Traverse():
+        shader = UsdShade.Shader(prim)
+        if shader and shader.GetIdAttr().Get() in ("ND_image_color3", "UsdUVTexture"):
+            return shader
+    return None
+
+
+check(wait(link, lambda: find_image() is not None), "the material has an image node")
+image = find_image()
+check(image.GetInput("file").Get().path == cached,
+      "and it points at the cached blob: %s" % image.GetInput("file").Get().path)
+
+# a second light must show up without anyone touching the node
+revision = lop.evalParm("revision")
+nomad.send({"type": "light", "link_id": "l2", "name": "Rim", "light_type": "directional",
+            "intensity": 2.0, "world_matrix": list(convert.IDENTITY)})
+check(wait(link, lambda: lop.evalParm("revision") != revision), "the LOP's revision is bumped")
+check(wait(link, lambda: bool(UsdLux.DistantLight(lop.stage().GetPrimAtPath("/nomad/Rim")))),
+      "the LOP recooked and the new light is on the stage")
+
+# Clear Cache: the cache is a session singleton, so a node cannot own its reset
+check(len(link.meshes) > 0 and len(link.textures) > 0, "there is something to clear")
+lop.parm("clear").pressButton()
+check(not link.meshes and not link.lights and not link.cameras and not link.textures,
+      "Clear Cache empties the scene, lights, cameras and textures")
+check(len(lop.stage().GetPrimAtPath("/nomad").GetChildren()) == 0
+      or not lop.stage().GetPrimAtPath("/nomad/Sculpt"),
+      "and the stage empties with it")
+check(len(node_in.geometry().points()) == 0, "the In SOP empties too")
+
+nomad.send(*nomad_quad_and_tri())
+check(wait(link, lambda: "m1" in link.meshes), "and a fresh scene loads after clearing")
+
+# ---------------------------------------------------------------- Out node identity
 # a pasted copy must not inherit the ids, or it would replace the original's mesh
 copy = hou.copyNodesTo([node_out], container)[0]
 check(copy.evalParm("meshid") == "" and copy.evalParm("geoid") == "",
