@@ -2,6 +2,13 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.45
+
+- Blender: vertex groups survive a full mesh from Nomad. A layered mesh sends every stroke as
+  a full mesh, and the rebuild used to drop the groups with the old geometry. Names always
+  come back; weights come back when the vertex count is unchanged.
+- No protocol change.
+
 ## 0.11.44
 
 - Houdini: a copied *Nomad Link Out* node is a new object in Nomad. The copy used to inherit

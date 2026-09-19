@@ -11,7 +11,7 @@ import threading
 import time
 
 
-VERSION = "0.11.44"  # bridge_version the examples report (the extension uses its manifest)
+VERSION = "0.11.45"  # bridge_version the examples report (the extension uses its manifest)
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DISCOVERY = b"NOMAD_LINK_DISCOVER 1"
 MAX_JSON = 50 << 20
@@ -112,11 +112,6 @@ DEFAULT_CAPABILITIES = [
 
 class Connection:
     def __init__(self, client_name, capabilities=None):
-        # byte-level counters: a frame only appears once it is complete, so these
-        # are the only way to tell a slow sender from a silent one
-        self.rx_bytes = 0
-        self.rx_last = 0.0
-        self.rx_recent = []   # (time, bytes) for the last few seconds
         self.client_name = client_name
         self.capabilities = list(DEFAULT_CAPABILITIES if capabilities is None else capabilities)
         self.incoming = queue.Queue()
@@ -220,12 +215,6 @@ class Connection:
         pending = bytearray()
         try:
             sock = socket.create_connection((host, port), timeout=5.0)
-            # a scene transfer is many frames; Nagle plus delayed ACK can stall
-            # each one by tens of milliseconds on some hosts
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
             sock.setblocking(False)
             self._socket = sock
             self.status = "Connected"
@@ -251,11 +240,6 @@ class Connection:
                     data = sock.recv(1 << 18)
                     if not data:
                         raise ConnectionError("Nomad closed the connection")
-                    now = time.monotonic()
-                    self.rx_bytes += len(data)
-                    self.rx_last = now
-                    self.rx_recent.append((now, len(data)))
-                    del self.rx_recent[:-400]
                     buffer.extend(data)
                     for packet in self._pop_frames(buffer):
                         self.incoming.put(packet)

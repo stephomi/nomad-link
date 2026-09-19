@@ -524,6 +524,28 @@ def set_float_attribute(mesh, name, values):
     attribute.data.foreach_set("value", values)
 
 
+def vertex_group_snapshot(obj):
+    """clear_geometry frees the group names with the geometry: they are mesh data since Blender 3.0."""
+    groups = [(group.name, []) for group in obj.vertex_groups]
+    if not groups:
+        return None
+    for vertex in obj.data.vertices:
+        for element in vertex.groups:
+            groups[element.group][1].append((vertex.index, element.weight))
+    return groups, obj.vertex_groups.active_index, len(obj.data.vertices)
+
+
+def restore_vertex_groups(obj, snapshot):
+    groups, active, vertex_count = snapshot
+    same_vertices = vertex_count == len(obj.data.vertices)
+    for name, entries in groups:
+        group = obj.vertex_groups.new(name=name)
+        if same_vertices:
+            for index, weight in entries:
+                group.add([index], weight, "REPLACE")
+    obj.vertex_groups.active_index = active
+
+
 def set_mapping_transform(mapping, offset, scale, rotation):
     sine = math.sin(rotation)
     cosine = math.cos(rotation)
@@ -1083,7 +1105,9 @@ def receive_mesh(header, binary):
         else:
             mesh = obj.data
             rebuild = True
+        groups = None
         if rebuild:
+            groups = vertex_group_snapshot(obj)
             if mesh.shape_keys:
                 obj.shape_key_clear()
             mesh.clear_geometry()
@@ -1096,6 +1120,8 @@ def receive_mesh(header, binary):
         mesh.polygons.add(face_count)
         mesh.polygons.foreach_set("loop_start", loop_starts)
         mesh.polygons.foreach_set("loop_total", loop_totals)
+        if groups:
+            restore_vertex_groups(obj, groups)
 
         texcoord_count = int(header.get("texcoord_count", 0))
         if texcoord_count:
