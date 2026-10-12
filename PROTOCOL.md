@@ -677,6 +677,15 @@ a re-parent must land before the delete that orphans it.
             },
             "normal": { "texture_id": "…", "factor": 1.0, "neg_y": false },
             "emissive": { "texture_id": "…", "factor": [1.0, 1.0, 1.0], "strength": 1.0 }, // strength [0, 10000]
+            "displacement": {
+                "texture_id": "…",
+                "factor": 0.02,               // height, not a [0, 1] multiplier: a vertex moves
+                                              // (sample - mid) × factor along its normal
+                "mid": 0.5,                   // sample value that leaves the vertex in place.
+                                              // Absent: 0.5
+                "world": false                // false: factor in object units, the height
+                                              // scales with the object. true: world units
+            },
             "roughness": {}                   // explicit clear. Channels: color, roughness,
                                               // metalness, normal, emissive, occlusion,
                                               // displacement, opacity

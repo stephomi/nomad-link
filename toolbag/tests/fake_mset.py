@@ -248,7 +248,8 @@ class Material:
             return
         if slot == "displacement" and shader == "Height":
             self.displacement = MaterialSubroutine(
-                "Height", {"Height Map": None, "Channel": 0, "Scale": 1.0})
+                "Height", {"Height Map": None, "Channel": 0, "Relative Scale": True,
+                           "Scale Center": 0.0, "Scale": 1.0})
             return
         raise ValueError("unknown shader %s for %s" % (shader, slot))
 

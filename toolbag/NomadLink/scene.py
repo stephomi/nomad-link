@@ -439,6 +439,14 @@ class Scene:
         elif _subroutine(material, "emission") is not None:
             self._set(material, "emission", [("intensity",), ("strength",)], 0.0)
 
+        # Height moves a vertex (sample - Scale Center) x Scale along its normal, as Nomad does
+        height = self._factor(textures, "displacement", 0.0)
+        if height is not None:
+            disp = textures.get("displacement") or {}
+            self._set_exact(material, "displacement", "scale", float(height) * self.unit_scale())
+            self._set(material, "displacement", [("scale", "center")], float(disp.get("mid", 0.5)))
+            self._set(material, "displacement", [("relative",)], False)
+
         self.trace("material textures")
         for channel, texture in textures.items():
             self._apply_texture(material, channel, texture)
@@ -563,6 +571,23 @@ class Scene:
         if field is None:
             self._log("no %s field for %s"
                       % (slot_name, "/".join(w[0] for w in candidates)))
+            return False
+        try:
+            slot.setField(field, value)
+            return True
+        except Exception as exc:
+            self._log("%s.%s not set: %s" % (slot_name, field, exc))
+            return False
+
+    def _set_exact(self, material, slot_name, name, value):
+        """Set the field called exactly name, where a word match would take a longer one."""
+        slot = self._slot(material, slot_name)
+        try:
+            field = next((f for f in slot.getFieldNames() if f.lower() == name), None)
+        except Exception:
+            field = None
+        if field is None:
+            self._log("no %s field for %s" % (slot_name, name))
             return False
         try:
             slot.setField(field, value)

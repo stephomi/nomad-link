@@ -427,6 +427,11 @@ def author_texture(stage, path, shader, reader, name, channel, textures):
         node.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(
             Gf.Vec4f(values[0], values[1 % len(values)], values[2 % len(values)], 1.0))
 
+    if name == "displacement":
+        height = float(factor) if factor is not None else 1.0
+        bias = -float(channel.get("mid", 0.5)) * height
+        node.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set(Gf.Vec4f(bias, bias, bias, 0.0))
+
     source = reader
     transform = uv_transform(stage, path, name, channel, reader)
     if transform is not None:

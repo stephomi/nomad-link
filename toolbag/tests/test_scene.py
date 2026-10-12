@@ -458,6 +458,22 @@ class SceneTest(unittest.TestCase):
             "displacement": {"texture_id": "d"}}})
         self.assertIs(material.surface.getField("Flip Y"), True)
         self.assertIsNotNone(material.displacement.getField("Height Map"))
+        # no height or mid sent: Nomad's defaults, absolute scale
+        self.assertAlmostEqual(material.displacement.getField("Scale"), 0.0, places=6)
+        self.assertAlmostEqual(material.displacement.getField("Scale Center"), 0.5, places=6)
+        self.assertIs(material.displacement.getField("Relative Scale"), False)
+
+    def test_the_displacement_height_and_mid_reach_the_height_shader(self):
+        mesh, built = self._cube()
+        self.scene.apply_mesh("cube", mesh, built)
+        self.scene.store_blob("d", "d.png", b"\x89PNG fake")
+        material = self.scene.apply_material("cube", {"textures": {
+            "displacement": {"texture_id": "d", "factor": 0.02, "mid": 0.25}}})
+        # meters to scene units, like the mesh positions
+        self.assertAlmostEqual(material.displacement.getField("Scale"),
+                               0.02 * self.scene.unit_scale(), places=6)
+        self.assertAlmostEqual(material.displacement.getField("Scale Center"), 0.25, places=6)
+        self.assertIs(material.displacement.getField("Relative Scale"), False)
 
     def test_the_material_type_picks_the_slot_that_carries_it(self):
         mesh, built = self._cube()

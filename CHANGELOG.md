@@ -2,6 +2,17 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.46
+
+- The `displacement` texture channel carries `mid` and `world` beside its `factor`, and the
+  factor is now a height in scene units: a vertex moves (sample − mid) × factor along its
+  normal. An absent `mid` reads as 0.5, so older peers keep working.
+- Houdini: the displacement texture gets the matching USD `bias`, so the surface stays where
+  Nomad shows it instead of rising by half the height.
+- Toolbag: the Height displacement takes the height as its Scale (in scene units, Relative
+  Scale off) and `mid` as its Scale Center. The map used to arrive alone, at Toolbag's own
+  scale.
+
 ## 0.11.45
 
 - Blender: vertex groups survive a full mesh from Nomad. A layered mesh sends every stroke as
