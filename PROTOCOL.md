@@ -225,6 +225,8 @@ Complete mesh state in one frame.
     "world_matrix": [ /* 16 floats */ ],  // ⭐ column-major (+ skew split, §3)
     "parent_id": "1b7e…",                 // hierarchy (§3); travels with child_index and
     "child_index": 2,                     //   the matrix pair, exactly as in object_state
+    "pivot_delta": [ /* 16 floats */ ],   // node-local pivot, shared by the geometry group;
+                                          //   repeat randomness turns around it. Absent = leave as-is
     "smooth_shading": true,               // ⭐
     "visible": true,                      // absent = leave as-is (new objects visible)
     "locked": false,                      // object lock (read-only content), absent = leave as-is
@@ -556,6 +558,7 @@ Values shown are defaults. Map supported fields and ignore the rest.
     "world_matrix": [ /* 16 floats, column-major */ ],
     "world_matrix_parent": [ /* … */ ],  // the parent's world when parent_id is set,
     "local_matrix": [ /* … */ ],         // else the skew split; world = parent × local
+    "pivot_delta": [ /* … */ ],          // node-local pivot (§7.1), absent = leave as-is
     "smooth_shading": true,              // meshes only
     "live_sync": true
 }
