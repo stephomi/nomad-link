@@ -675,10 +675,10 @@ a re-parent must land before the delete that orphans it.
                 "rotation": 0.0,              // radians
                 "triplanar_hardness": [0.9, 0.9, 0.9], // [0, 1] each
                 "triplanar_world": true,
-                "factor": [1.0, 1.0, 1.0]     // [0, 1], multiplies the sample; rgb on color and
-                                              // emissive, scalar on the other channels.
-                                              // color multiplies vertex paint on top, the
-                                              // other channels replace it
+                "factor": [1.0, 1.0, 1.0],    // [0, 1], multiplies the sample; rgb on color and
+                                              // emissive, scalar on the other channels
+                "intensity": 1.0              // [0, 1], color, roughness, metalness and opacity
+                                              // only. How much of the scaled sample shows. Absent: 1.0
             },
             "normal": { "texture_id": "…", "factor": 1.0, "neg_y": false },
             "emissive": { "texture_id": "…", "factor": [1.0, 1.0, 1.0], "strength": 1.0 }, // strength [0, 10000]
@@ -702,6 +702,14 @@ a re-parent must land before the delete that orphans it.
 † Auto settings use two fields. Apply `<name>_value`. `<name>_auto` records whether the
 value comes from the receiver's default. Send `<name>_auto: true` only to restore that
 default.
+
+A texture channel with factor `f` and intensity `w` shows, where `paint` is the vertex
+paint, or the material value on a mesh without it:
+
+- color: `paint × mix(1, sample × f, w)`
+- roughness, metalness: `mix(paint, sample × f, w)`
+- opacity: `paint alpha × mix(1, sample × f, w)`. With `use_color_opacity`, the color
+  texture's alpha multiplies in as `mix(1, alpha, w)`, `w` taken from the color channel.
 
 Send only edited fields. Absent fields are unchanged. The protocol has no matcap
 channel. `mesh_full` also has top-level `smooth_shading`.

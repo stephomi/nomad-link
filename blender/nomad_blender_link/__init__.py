@@ -853,9 +853,23 @@ def request_asset(asset_id):
     connection.send({"type": "request_asset", "collection": "environments", "asset_id": asset_id})
 
 
-def apply_material_textures(material, shader, settings, link_id, has_uv):
+def tagged_node(nodes, tag, channel):
+    return next((node for node in nodes if node.get(tag) == channel), None)
+
+
+def node_socket(sockets, identifier):
+    """A socket by identifier: a Mix node repeats each socket name once per data type."""
+    return next(item for item in sockets if item.identifier == identifier)
+
+
+def apply_material_textures(material, shader, settings, link_id, has_uv, paint_node):
     """Wire the Nomad texture channels into the Principled node graph; returns the set
-    of channels an image node now feeds (a texture replaces the matching vertex paint).
+    of channels an image node now feeds.
+
+    Each channel follows Nomad's shader: the sample is scaled by the factor, then the
+    intensity blends it with what the channel shows without a texture. Color multiplies
+    the vertex paint, roughness and metalness mix with it, opacity multiplies the vertex
+    alpha. `paint_node(channel)` returns the vertex paint attribute node, or None.
 
     Ids missing from the blob cache are requested from Nomad; the material settings wait
     in pending_materials and are re-applied when the blobs arrive. Rows follow the
@@ -869,6 +883,52 @@ def apply_material_textures(material, shader, settings, link_id, has_uv):
     missing = set()
     wired = set()
     triplanar_groups = {}
+
+    def entry_value(channel, key, default):
+        entry = textures.get(channel)
+        return entry.get(key, default) if isinstance(entry, dict) else default
+
+    def scaled(sample, channel, y):
+        """The sample times the channel factor; no node when the factor is neutral."""
+        if channel == "color":
+            factor = tuple(float(value) for value in entry_value(channel, "factor", (1.0, 1.0, 1.0)))[:3]
+            if factor == (1.0, 1.0, 1.0):
+                return sample
+            node = nodes.new("ShaderNodeMix")
+            node.data_type = "RGBA"
+            node.blend_type = "MULTIPLY"
+            node_socket(node.inputs, "Factor_Float").default_value = 1.0
+            node_socket(node.inputs, "B_Color").default_value = (*factor, 1.0)
+            links.new(sample, node_socket(node.inputs, "A_Color"))
+            output = node_socket(node.outputs, "Result_Color")
+        else:
+            factor = float(entry_value(channel, "factor", 1.0))
+            if factor == 1.0:
+                return sample
+            node = nodes.new("ShaderNodeMath")
+            node.operation = "MULTIPLY"
+            node.inputs[1].default_value = factor
+            links.new(sample, node.inputs[0])
+            output = node.outputs[0]
+        node["nomad_factor"] = channel
+        node.label = channel.title() + " Factor"
+        node.location = (-420.0, y - 100.0)
+        return output
+
+    def blended(sample, channel, y, tag=None):
+        """mix(1, sample, intensity), the weight a texture puts on a multiplied channel."""
+        intensity = float(entry_value(channel, "intensity", 1.0))
+        if intensity >= 1.0:
+            return sample
+        node = nodes.new("ShaderNodeMix")
+        node.data_type = "FLOAT"
+        node_socket(node.inputs, "Factor_Float").default_value = intensity
+        node_socket(node.inputs, "A_Float").default_value = 1.0
+        links.new(sample, node_socket(node.inputs, "B_Float"))
+        node["nomad_intensity"] = tag or channel
+        node.label = (tag or channel).replace("_", " ").title() + " Intensity"
+        node.location = (-220.0, y)
+        return node_socket(node.outputs, "Result_Float")
 
     def channel_node(channel, non_color, y, label=None):
         entry = textures.get(channel)
@@ -926,33 +986,75 @@ def apply_material_textures(material, shader, settings, link_id, has_uv):
 
     color = channel_node("color", False, 520.0)
     if color is not None:
-        links.new(color.outputs["Color"], shader.inputs["Base Color"])
-    node = channel_node("metalness", True, 220.0)
-    if node is not None:
-        links.new(node.outputs["Color"], shader.inputs["Metallic"])
-    node = channel_node("roughness", True, -80.0)
-    if node is not None:
-        links.new(node.outputs["Color"], shader.inputs["Roughness"])
+        # vertex paint × mix(1, sample, intensity), which is Blender's MULTIPLY mix
+        node = nodes.new("ShaderNodeMix")
+        node.data_type = "RGBA"
+        node.blend_type = "MULTIPLY"
+        node_socket(node.inputs, "Factor_Float").default_value = float(entry_value("color", "intensity", 1.0))
+        node["nomad_intensity"] = "color"
+        node.label = "Color Intensity"
+        node.location = (-220.0, 520.0)
+        paint = paint_node("color")
+        if paint is not None:
+            links.new(paint.outputs["Color"], node_socket(node.inputs, "A_Color"))
+        else:
+            node_socket(node.inputs, "A_Color").default_value = (*settings.get("color", (1.0, 1.0, 1.0)), 1.0)
+        links.new(scaled(color.outputs["Color"], "color", 520.0), node_socket(node.inputs, "B_Color"))
+        links.new(node_socket(node.outputs, "Result_Color"), shader.inputs["Base Color"])
+    for channel, name, y, default in (
+        ("metalness", "Metallic", 220.0, 0.0),
+        ("roughness", "Roughness", -80.0, 0.25),
+    ):
+        node = channel_node(channel, True, y)
+        if node is None:
+            continue
+        value = scaled(node.outputs["Color"], channel, y)
+        intensity = float(entry_value(channel, "intensity", 1.0))
+        if intensity < 1.0:
+            mix = nodes.new("ShaderNodeMix")
+            mix.data_type = "FLOAT"
+            node_socket(mix.inputs, "Factor_Float").default_value = intensity
+            mix["nomad_intensity"] = channel
+            mix.label = channel.title() + " Intensity"
+            mix.location = (-220.0, y)
+            paint = paint_node(channel)
+            if paint is not None:
+                links.new(paint.outputs["Fac"], node_socket(mix.inputs, "A_Float"))
+            else:
+                node_socket(mix.inputs, "A_Float").default_value = float(settings.get(channel, default))
+            links.new(value, node_socket(mix.inputs, "B_Float"))
+            value = node_socket(mix.outputs, "Result_Float")
+        links.new(value, shader.inputs[name])
+
+    # alpha: vertex alpha × color texture alpha × opacity texture, each texture term
+    # weighted by its intensity
+    alpha_terms = []
+    paint = paint_node("color")
+    if paint is not None:
+        alpha_terms.append(paint.outputs["Alpha"])
     color_alpha = (
         channel_node("color", False, -380.0, "Color Alpha")
         if settings.get("use_color_opacity_value", False)
         else None
     )
+    if color_alpha is not None:
+        alpha_terms.append(blended(color_alpha.outputs["Alpha"], "color", -380.0, "color_alpha"))
     opacity_y = -680.0 if color_alpha is not None else -380.0
     opacity = channel_node("opacity", True, opacity_y)
-    if color_alpha is not None and opacity is not None:
-        multiply = nodes.new("ShaderNodeMath")
-        multiply.operation = "MULTIPLY"
-        multiply.label = "Opacity"
-        multiply.location = (-320.0, -530.0)
-        links.new(color_alpha.outputs["Alpha"], multiply.inputs[0])
-        links.new(opacity.outputs["Color"], multiply.inputs[1])
-        links.new(multiply.outputs[0], shader.inputs["Alpha"])
-    elif color_alpha is not None:
-        links.new(color_alpha.outputs["Alpha"], shader.inputs["Alpha"])
-    elif opacity is not None:
-        links.new(opacity.outputs["Color"], shader.inputs["Alpha"])
-    if color_alpha is not None or opacity is not None:
+    if opacity is not None:
+        value = scaled(opacity.outputs["Color"], "opacity", opacity_y)
+        alpha_terms.append(blended(value, "opacity", opacity_y))
+    if alpha_terms:
+        alpha = alpha_terms[0]
+        for index, term in enumerate(alpha_terms[1:]):
+            multiply = nodes.new("ShaderNodeMath")
+            multiply.operation = "MULTIPLY"
+            multiply.label = "Opacity" if index == 0 else f"Opacity {index + 1}"
+            multiply.location = (-80.0, -530.0 - 160.0 * index)
+            links.new(alpha, multiply.inputs[0])
+            links.new(term, multiply.inputs[1])
+            alpha = multiply.outputs[0]
+        links.new(alpha, shader.inputs["Alpha"])
         material.surface_render_method = "DITHERED"
     normal_y = opacity_y - 300.0
     node = channel_node("normal", True, normal_y)
@@ -1022,27 +1124,35 @@ def make_material(mesh, header, has_color, has_roughness, has_metalness, link_id
     shader.inputs["Subsurface Scale"].default_value = max(float(settings.get("subsurface_depth", 1.0)), 0.0)
     material.node_tree.links.new(shader.outputs["BSDF"], output.inputs["Surface"])
 
-    # a texture replaces the matching vertex paint; the attributes only feed the
-    # channels no image covers (a pending blob keeps its attribute until it lands)
-    wired = apply_material_textures(material, shader, settings, link_id, bool(mesh.uv_layers))
-    if has_color and "color" not in wired:
-        node = nodes.new("ShaderNodeAttribute")
-        node.location = (-320.0, 520.0)
-        node.attribute_name = COLOR_ATTRIBUTE
-        material.node_tree.links.new(node.outputs["Color"], shader.inputs["Base Color"])
-        if "opacity" not in wired:
-            material.node_tree.links.new(node.outputs["Alpha"], shader.inputs["Alpha"])
-        material.surface_render_method = "DITHERED"
-    if has_metalness and "metalness" not in wired:
-        node = nodes.new("ShaderNodeAttribute")
-        node.location = (-320.0, 220.0)
-        node.attribute_name = METALNESS_ATTRIBUTE
-        material.node_tree.links.new(node.outputs["Fac"], shader.inputs["Metallic"])
-    if has_roughness and "roughness" not in wired:
-        node = nodes.new("ShaderNodeAttribute")
-        node.location = (-320.0, -80.0)
-        node.attribute_name = ROUGHNESS_ATTRIBUTE
-        material.node_tree.links.new(node.outputs["Fac"], shader.inputs["Roughness"])
+    # vertex paint attributes, created on first use; a pending blob keeps its attribute
+    # until it lands
+    paint_attributes = {
+        "color": (has_color, COLOR_ATTRIBUTE, 520.0),
+        "metalness": (has_metalness, METALNESS_ATTRIBUTE, 220.0),
+        "roughness": (has_roughness, ROUGHNESS_ATTRIBUTE, -80.0),
+    }
+    paint_nodes = {}
+
+    def paint_node(channel):
+        has_paint, attribute, y = paint_attributes[channel]
+        if not has_paint:
+            return None
+        if channel not in paint_nodes:
+            node = nodes.new("ShaderNodeAttribute")
+            node.location = (-420.0, y + 60.0)
+            node.attribute_name = attribute
+            paint_nodes[channel] = node
+        return paint_nodes[channel]
+
+    wired = apply_material_textures(material, shader, settings, link_id, bool(mesh.uv_layers), paint_node)
+    for channel, output, name in (
+        ("color", "Color", "Base Color"),
+        ("metalness", "Fac", "Metallic"),
+        ("roughness", "Fac", "Roughness"),
+    ):
+        node = paint_node(channel) if channel not in wired else None
+        if node is not None:
+            material.node_tree.links.new(node.outputs[output], shader.inputs[name])
 
     for node in nodes:
         key = (node.bl_idname, node.label or getattr(node, "attribute_name", ""))
@@ -1751,6 +1861,17 @@ def material_textures(shader, store=None):
             if wrapper is not None and wrapper.type == "NORMAL_MAP":
                 entry["neg_y"] = wrapper.convention == "DIRECTX"
                 entry["factor"] = float(wrapper.inputs["Strength"].default_value)
+        if channel in ("color", "roughness", "metalness", "opacity"):
+            # what Blender shows: no factor or intensity node means 1
+            nodes = shader.id_data.nodes
+            factor = tagged_node(nodes, "nomad_factor", channel)
+            if channel == "color":
+                tint = node_socket(factor.inputs, "B_Color").default_value[:3] if factor else (1.0, 1.0, 1.0)
+                entry["factor"] = [float(value) for value in tint]
+            else:
+                entry["factor"] = float(factor.inputs[1].default_value) if factor else 1.0
+            intensity = tagged_node(nodes, "nomad_intensity", channel)
+            entry["intensity"] = float(node_socket(intensity.inputs, "Factor_Float").default_value) if intensity else 1.0
         textures[channel] = entry
     return textures, use_color_opacity
 
@@ -1766,6 +1887,17 @@ def material_settings(obj, has_color, has_roughness, has_metalness, store=None):
         opacity = float(shader.inputs["Alpha"].default_value)
         roughness = float(shader.inputs["Roughness"].default_value)
         metalness = float(shader.inputs["Metallic"].default_value)
+        # an intensity mix holds the untextured value when no vertex paint feeds it
+        nodes = shader.id_data.nodes
+        mix = tagged_node(nodes, "nomad_intensity", "color")
+        if mix is not None and not node_socket(mix.inputs, "A_Color").is_linked:
+            color = tuple(node_socket(mix.inputs, "A_Color").default_value[:3])
+        mix = tagged_node(nodes, "nomad_intensity", "roughness")
+        if mix is not None and not node_socket(mix.inputs, "A_Float").is_linked:
+            roughness = float(node_socket(mix.inputs, "A_Float").default_value)
+        mix = tagged_node(nodes, "nomad_intensity", "metalness")
+        if mix is not None and not node_socket(mix.inputs, "A_Float").is_linked:
+            metalness = float(node_socket(mix.inputs, "A_Float").default_value)
     subsurface = float(shader_input(shader, "Subsurface Weight", 0.0))
     material_type = material.get("nomad_material_type", "subsurface" if subsurface > 0.0 else "opaque") if material else "opaque"
     # only fields with a real Blender source: absent keys keep their Nomad-side values
@@ -3911,6 +4043,8 @@ NOM_IMAGE_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg",
 NOM_CHANNEL_FACTORS = {"color": "factorColor", "roughness": "factorRoughness",
                        "metalness": "factorMetalness", "normal": "factorNormal",
                        "emissive": "factorEmissive", "opacity": "factorOpacity"}
+NOM_CHANNEL_INTENSITIES = {"color": "intensityColor", "roughness": "intensityRoughness",
+                           "metalness": "intensityMetalness", "opacity": "intensityOpacity"}
 
 
 def import_nom_image(name, mime, data, tag, tag_value):
@@ -3954,6 +4088,9 @@ def import_nom_settings(nom, source):
         factor = settings.get(NOM_CHANNEL_FACTORS.get(channel, ""), None)
         if factor is not None:
             converted["factor"] = factor
+        intensity = settings.get(NOM_CHANNEL_INTENSITIES.get(channel, ""), None)
+        if intensity is not None:
+            converted["intensity"] = intensity
         if channel == "normal":
             converted["neg_y"] = settings.get("normal_neg_y", settings.get("flip_y", False))
         out[channel] = converted
@@ -4260,6 +4397,8 @@ def export_nom_material(writer, settings, smooth):
                 jtex[key] = source[key]
         if "factor" in source:
             entry[NOM_CHANNEL_FACTORS[channel]] = source["factor"]
+        if "intensity" in source:
+            entry[NOM_CHANNEL_INTENSITIES[channel]] = source["intensity"]
         if channel == "normal":
             entry["normal_neg_y"] = bool(source.get("neg_y", False))
         textures[channel] = jtex

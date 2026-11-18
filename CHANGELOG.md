@@ -2,6 +2,16 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.48
+
+- The `color`, `roughness`, `metalness` and `opacity` texture channels carry an
+  `intensity`, how much of the texture shows. At 0 the mesh looks as if the channel had no
+  texture. An absent `intensity` reads as 1.0, so older peers keep working.
+- Blender: the material follows Nomad's texture shading. The color texture multiplies
+  the vertex paint instead of replacing it, roughness and metalness mix with their vertex
+  paint by the intensity, and the vertex alpha multiplies the opacity. The texture factor
+  applies too, and both values travel back to Nomad and through .nom files.
+
 ## 0.11.47
 
 - Blender: **File → Export → Nomad Sculpt (.nom)** saves the scene as a Nomad file, without

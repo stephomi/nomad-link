@@ -93,7 +93,9 @@ if image_nodes:
     check("clamp wrap became EXTEND", image_nodes[0].extension == "EXTEND", image_nodes[0].extension)
     shader = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
     feeds = [l for l in tree.links if l.to_node == shader and l.to_socket.name == "Base Color"]
-    check("texture feeds Base Color", bool(feeds) and feeds[0].from_node == image_nodes[0])
+    mix = feeds[0].from_node if feeds else None
+    sample = addon.node_socket(mix.inputs, "B_Color").links if mix is not None and mix.type == "MIX" else []
+    check("texture feeds Base Color through the intensity mix", bool(sample) and sample[0].from_node == image_nodes[0])
 
 # --- light
 spot = bpy.data.objects["Spot"]
