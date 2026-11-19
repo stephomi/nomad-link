@@ -862,14 +862,15 @@ def node_socket(sockets, identifier):
     return next(item for item in sockets if item.identifier == identifier)
 
 
-def apply_material_textures(material, shader, settings, link_id, has_uv, paint_node):
+def apply_material_textures(material, shader, output, settings, link_id, has_uv, paint_node):
     """Wire the Nomad texture channels into the Principled node graph; returns the set
     of channels an image node now feeds.
 
     Each channel follows Nomad's shader: the sample is scaled by the factor, then the
     intensity blends it with what the channel shows without a texture. Color multiplies
     the vertex paint, roughness and metalness mix with it, opacity multiplies the vertex
-    alpha. `paint_node(channel)` returns the vertex paint attribute node, or None.
+    alpha. Displacement feeds the material output: (sample - mid) × factor along the normal.
+    `paint_node(channel)` returns the vertex paint attribute node, or None.
 
     Ids missing from the blob cache are requested from Nomad; the material settings wait
     in pending_materials and are re-applied when the blobs arrive. Rows follow the
@@ -1071,7 +1072,18 @@ def apply_material_textures(material, shader, settings, link_id, has_uv, paint_n
         shader.inputs["Emission Strength"].default_value = float(
             textures.get("emissive", {}).get("strength", 1.0)
         )
-    # occlusion/displacement have no Principled slot; those channels stay Nomad-side
+    displacement_y = normal_y - 600.0
+    node = channel_node("displacement", True, displacement_y)
+    if node is not None:
+        displacement = nodes.new("ShaderNodeDisplacement")
+        displacement.location = (300.0, displacement_y)
+        displacement.space = "WORLD" if entry_value("displacement", "world", False) else "OBJECT"
+        displacement.inputs["Scale"].default_value = float(entry_value("displacement", "factor", 0.0))
+        displacement.inputs["Midlevel"].default_value = float(entry_value("displacement", "mid", 0.5))
+        links.new(node.outputs["Color"], displacement.inputs["Height"])
+        links.new(displacement.outputs["Displacement"], output.inputs["Displacement"])
+        material.displacement_method = "BOTH"
+    # occlusion has no Principled slot; that channel stays Nomad-side
 
     if link_id:
         if missing:
@@ -1144,7 +1156,7 @@ def make_material(mesh, header, has_color, has_roughness, has_metalness, link_id
             paint_nodes[channel] = node
         return paint_nodes[channel]
 
-    wired = apply_material_textures(material, shader, settings, link_id, bool(mesh.uv_layers), paint_node)
+    wired = apply_material_textures(material, shader, output, settings, link_id, bool(mesh.uv_layers), paint_node)
     for channel, output, name in (
         ("color", "Color", "Base Color"),
         ("metalness", "Fac", "Metallic"),
@@ -1785,11 +1797,13 @@ def material_textures(shader, store=None):
     """The texture channels Blender models, as blob references; `store` turns an image into
     one, by default queuing unsent blobs on the wire.
 
-    A channel without an image sends the explicit {} clear; channels Blender cannot
-    represent (occlusion, displacement) stay absent so Nomad keeps them.
+    A channel without an image sends the explicit {} clear; occlusion, which Blender cannot
+    represent, stays absent so Nomad keeps it.
     """
     if shader is None or (store is None and "texture" not in remote_capabilities):
         return None, None
+    outputs = [node for node in shader.id_data.nodes if node.type == "OUTPUT_MATERIAL"]
+    output = next((node for node in outputs if node.is_active_output), outputs[0] if outputs else None)
     color_image = linked_image(shader, "Base Color")
     alpha_images = linked_images(shader, "Alpha")
     color_alpha = [node for node in alpha_images if node == color_image or node.get("nomad_color_alpha")]
@@ -1803,10 +1817,13 @@ def material_textures(shader, store=None):
         ("normal", "Normal"),
         ("emissive", "Emission Color"),
         ("opacity", "Alpha"),
+        ("displacement", "Displacement"),
     ):
         image_node = color_image if channel == "color" else linked_image(shader, name)
         if channel == "opacity":
             image_node = opacity_image
+        if channel == "displacement":
+            image_node = linked_image(output, name) if output else None
         if channel == "opacity" and image_node is None and use_color_opacity:
             textures[channel] = {}
             continue
@@ -1861,6 +1878,12 @@ def material_textures(shader, store=None):
             if wrapper is not None and wrapper.type == "NORMAL_MAP":
                 entry["neg_y"] = wrapper.convention == "DIRECTX"
                 entry["factor"] = float(wrapper.inputs["Strength"].default_value)
+        if channel == "displacement":
+            wrapper = output.inputs["Displacement"].links[0].from_node
+            if wrapper.type == "DISPLACEMENT":
+                entry["factor"] = float(wrapper.inputs["Scale"].default_value)
+                entry["mid"] = float(wrapper.inputs["Midlevel"].default_value)
+                entry["world"] = wrapper.space == "WORLD"
         if channel in ("color", "roughness", "metalness", "opacity"):
             # what Blender shows: no factor or intensity node means 1
             nodes = shader.id_data.nodes
@@ -4042,7 +4065,8 @@ NOM_IMAGE_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg",
 # per-channel texture factor, stored flat on the .nom material entry
 NOM_CHANNEL_FACTORS = {"color": "factorColor", "roughness": "factorRoughness",
                        "metalness": "factorMetalness", "normal": "factorNormal",
-                       "emissive": "factorEmissive", "opacity": "factorOpacity"}
+                       "emissive": "factorEmissive", "opacity": "factorOpacity",
+                       "displacement": "factorDisplacement"}
 NOM_CHANNEL_INTENSITIES = {"color": "intensityColor", "roughness": "intensityRoughness",
                            "metalness": "intensityMetalness", "opacity": "intensityOpacity"}
 
@@ -4093,6 +4117,9 @@ def import_nom_settings(nom, source):
             converted["intensity"] = intensity
         if channel == "normal":
             converted["neg_y"] = settings.get("normal_neg_y", settings.get("flip_y", False))
+        if channel == "displacement":
+            converted["mid"] = settings.get("displacementMid", 0.5)
+            converted["world"] = settings.get("displacementWorld", False)
         out[channel] = converted
     settings["textures"] = out
     return settings
@@ -4401,6 +4428,9 @@ def export_nom_material(writer, settings, smooth):
             entry[NOM_CHANNEL_INTENSITIES[channel]] = source["intensity"]
         if channel == "normal":
             entry["normal_neg_y"] = bool(source.get("neg_y", False))
+        if channel == "displacement":
+            entry["displacementMid"] = float(source.get("mid", 0.5))
+            entry["displacementWorld"] = bool(source.get("world", False))
         textures[channel] = jtex
     if textures:
         entry["textures"] = textures

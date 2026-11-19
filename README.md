@@ -6,7 +6,7 @@ sync with other applications: meshes, sculpt layers, paint, materials, lights, c
 **[PROTOCOL.md](PROTOCOL.md) is the wire specification** — enough to write a bridge for
 any application, in any language.
 
-Version **0.11.48**, protocol **1**.
+Version **0.11.49**, protocol **1**.
 
 ## Contents
 
@@ -54,6 +54,8 @@ unzip it, and copy the enclosed `NomadLink` folder into Toolbag's user plugin fo
 **NomadLink**. See `toolbag/README.md`.
 
 ## Blender extension
+
+The extension needs Blender 4.5 or later. Older versions don't list it.
 
 Install it in Blender by adding the remote repository
 `https://nomadsculpt.com/blender/index.json`, which serves the contents of
