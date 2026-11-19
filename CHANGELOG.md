@@ -2,6 +2,13 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.49
+
+- Blender: the displacement texture feeds the Material Output through a Displacement node,
+  with the height as its Scale, `mid` as its Midlevel and `world` as its space. The material
+  displaces and bumps, like Nomad. A Displacement node on a Blender material travels back to
+  Nomad and into .nom files.
+
 ## 0.11.48
 
 - The `color`, `roughness`, `metalness` and `opacity` texture channels carry an
