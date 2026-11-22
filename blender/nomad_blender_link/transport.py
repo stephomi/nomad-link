@@ -11,13 +11,18 @@ import threading
 import time
 
 
-VERSION = "0.11.49"  # bridge_version the examples report (the extension uses its manifest)
+VERSION = "0.11.50"  # bridge_version the examples report (the extension uses its manifest)
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DISCOVERY = b"NOMAD_LINK_DISCOVER 1"
 MAX_JSON = 50 << 20
 MAX_BINARY = 0xFFFFFFFF  # the header field is uint32: nothing larger can be framed
 MDNS_GROUP = ("224.0.0.251", 5353)
 MDNS_SERVICE = b"_nomadlink._tcp.local"
+
+
+def device_name():
+    # the computer's network name without its domain, like Nomad's own device name
+    return socket.gethostname().split(".")[0]
 
 
 def mdns_query():
@@ -226,6 +231,7 @@ class Connection:
                         "pair_token": pair_token,
                         "bridge_version": version,
                         "client_name": self.client_name,
+                        "device_name": device_name(),
                         "capabilities": self.capabilities,
                     },
                     b"",
@@ -402,6 +408,7 @@ class Connection:
                     "pair_token": pair_token,
                     "bridge_version": version,
                     "client_name": self.client_name,
+                    "device_name": device_name(),
                     "capabilities": self.capabilities,
                 },
                 b"",

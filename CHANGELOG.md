@@ -2,6 +2,12 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.50
+
+- The `hello` carries an optional `device_name`, the computer's name. Nomad lists a paired
+  client as `MacBook-Pro · Blender` instead of `Blender (192.168.1.20)`. Nomad sends its own
+  `device_name` when it joins or answers another Nomad.
+
 ## 0.11.49
 
 - Blender: the displacement texture feeds the Material Output through a Displacement node,

@@ -99,10 +99,14 @@ The client connects and immediately sends:
     "pair_token": "<stored token or empty>",
     "bridge_version": "1.2.3",
     "client_name": "Blender",
+    "device_name": "MacBook-Pro",
     "capabilities": ["selection_transfer", "scene_transfer", "..."]
 }
 ```
 
+- `client_name` names the application and `device_name` the computer it runs on, both
+  optional. Nomad lists a paired client as `MacBook-Pro · Blender`, or as
+  `Blender (192.168.1.20)` without a `device_name`.
 - Wrong `protocol`: `error`, then disconnect.
 - Known `pair_token`: Nomad replies with `hello`.
 - Unknown or empty token: Nomad replies with `{"type": "pairing_pending"}`. Keep the
@@ -115,6 +119,8 @@ Nomad's `hello` reply:
 {
     "type": "hello",
     "protocol": 1,
+    "client_name": "Nomad Mac",
+    "device_name": "MacBook-Pro",
     "nomad_version": "2.x",
     "minimum_bridge_version": "...",
     "capabilities": ["..."],
